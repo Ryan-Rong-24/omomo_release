@@ -1,0 +1,10 @@
+Training Summary
+================
+Total steps: 2000
+Best step: 1870
+Best loss: 0.055885
+Final loss: 0.211496
+Demo ID: P0001_10a27bf7
+Object ID: 37787722328019
+Trajectory length: 3670 frames
+Window size: 64

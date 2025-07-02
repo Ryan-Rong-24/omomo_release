@@ -19,3 +19,6 @@ core
 *.json
 *.blend
 *.blend*
+__pycache__
+hot3d/
+human_body_prior/

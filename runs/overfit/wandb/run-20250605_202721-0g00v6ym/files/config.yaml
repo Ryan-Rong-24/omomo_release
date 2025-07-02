@@ -1,0 +1,64 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    cli_version: 0.12.21
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    python_version: 3.8.20
+    start_time: 1749155241
+    t:
+      1:
+      - 1
+      - 55
+      2:
+      - 1
+      - 55
+      3:
+      - 13
+      - 16
+      4: 3.8.20
+      5: 0.12.21
+      8:
+      - 5
+d_k:
+  desc: null
+  value: 64
+d_model:
+  desc: null
+  value: 512
+d_v:
+  desc: null
+  value: 64
+entity:
+  desc: null
+  value: egorecon
+exp_name:
+  desc: null
+  value: overfit_test
+learning_rate:
+  desc: null
+  value: 0.0001
+n_dec_layers:
+  desc: null
+  value: 6
+n_head:
+  desc: null
+  value: 8
+num_steps:
+  desc: null
+  value: 10000
+save_dir:
+  desc: null
+  value: runs/overfit
+use_wandb:
+  desc: null
+  value: true
+wandb_pj_name:
+  desc: null
+  value: egorecon
+window:
+  desc: null
+  value: 64

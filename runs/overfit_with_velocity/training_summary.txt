@@ -1,0 +1,14 @@
+Training Summary
+================
+Total steps: 5000
+Best step: 3000
+Best eval error: 0.1481m
+Final loss: 0.032539
+Final mean position error: 0.3019m
+Final max position error: 0.9553m
+Demo ID: P0001_10a27bf7
+Object ID: 37787722328019
+Trajectory length: 3670 frames
+Window size: 128
+Use velocity: True
+Data dimension: 12D
