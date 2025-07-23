@@ -12,7 +12,7 @@ import pickle
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 
 from ema_pytorch import EMA
@@ -208,13 +208,21 @@ class HandToObjectDataset(Dataset):
             right_hand = right_hand[:self.window]
             object_motion = object_motion[:self.window]
 
-        # Center the entire window around the object's position in the first frame.
+        # Store the object's origin but keep all data in world coordinates
         origin = torch.zeros(3, dtype=torch.float32)
         if actual_len > 0:
             origin = object_motion[0, :3].clone()
-            object_motion[:, :3] -= origin
-            left_hand[:, :3] -= origin
-            right_hand[:, :3] -= origin
+
+        # Frame level weights based on velocity magnitude (before padding)
+        frame_weights = torch.ones(self.window, dtype=torch.float32)
+        if actual_len > 1:
+            vel = torch.norm(object_motion[1:actual_len, :3] - object_motion[:actual_len-1, :3], dim=1)
+            w = 1.0 + 9.0 * (vel > 0.04).float()
+            frame_weights[1:actual_len] = w
+            frame_weights[0] = frame_weights[1]
+
+        if actual_len < self.window:
+            frame_weights[actual_len:] = 0.0
         
         # Pad if necessary
         if actual_len < self.window:
@@ -231,7 +239,8 @@ class HandToObjectDataset(Dataset):
             'demo_id': demo_id,
             'obj_id': obj_id,
             'is_moving': is_moving,
-            'origin': origin
+            'origin': origin,
+            'frame_weights': frame_weights
         }
     
     def _balance_dataset(self):
@@ -390,9 +399,13 @@ class Trainer(object):
         self.opt = opt
         self.window = opt.window
         
-        # Store datasets directly (no need for DataLoader cycling)
+        # Keep datasets and create dataloaders for stable batching
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
+        self.train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, drop_last=True)
+        self.val_loader = DataLoader(val_dataset, batch_size=train_batch_size, shuffle=False)
+        self.train_iter = iter(self.train_loader)
+        self.val_iter = iter(self.val_loader)
         
         # Weighted loss parameters
         self.use_weighted_loss = use_weighted_loss
@@ -423,37 +436,38 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             for i in range(self.gradient_accumulate_every):
-                # Sample from dataset directly (like overfit script)
-                data_dict = self.train_dataset.sample_window(mode='random')
-                
-                left_hand = data_dict['left_hand'].cuda().unsqueeze(0)  # Add batch dim
-                right_hand = data_dict['right_hand'].cuda().unsqueeze(0)
-                object_motion = data_dict['object_motion'].cuda().unsqueeze(0)
-                seq_len = data_dict['seq_len'].cuda().unsqueeze(0)
+                try:
+                    batch = next(self.train_iter)
+                except StopIteration:
+                    self.train_iter = iter(self.train_loader)
+                    batch = next(self.train_iter)
+
+                left_hand = batch['left_hand'].cuda()
+                right_hand = batch['right_hand'].cuda()
+                object_motion = batch['object_motion'].cuda()
+                seq_len = batch['seq_len'].cuda()
+                frame_weights = batch['frame_weights'].cuda()
 
                 hand_poses = torch.cat([left_hand, right_hand], dim=-1)
-                
+
                 # Generate padding mask (like overfit script)
                 actual_seq_len = seq_len + 1
-                tmp_mask = torch.arange(self.window+1, device='cuda').expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
+                tmp_mask = torch.arange(self.window+1, device=hand_poses.device).expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
                 padding_mask = tmp_mask[:, None, :]
 
                 with autocast(enabled=self.amp):
-                    loss = self.model(object_motion, hand_poses, padding_mask=padding_mask)
-                    
-                    # Apply weighted loss if enabled
-                    if self.use_weighted_loss and 'is_moving' in data_dict:
-                        is_moving = data_dict['is_moving']
-                        if is_moving:
-                            loss = loss * self.moving_weight
+                    loss = self.model(object_motion, hand_poses, padding_mask=padding_mask, frame_weight=frame_weights)
+
+                    if self.use_weighted_loss and 'is_moving' in batch:
+                        is_moving = batch['is_moving']
+                        loss = loss * (1 + (self.moving_weight - 1) * is_moving.float())
                     
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
                 if self.use_wandb:
-                    # Log additional metrics
                     log_dict = {"Train/Loss": loss.item()}
-                    if 'is_moving' in data_dict:
-                        log_dict["Train/Is_Moving"] = float(data_dict['is_moving'])
+                    if 'is_moving' in batch:
+                        log_dict["Train/Is_Moving"] = float(batch['is_moving'].mean())
                     wandb.log(log_dict)
 
             self.scaler.step(self.optimizer)
@@ -463,21 +477,25 @@ class Trainer(object):
             if self.step % self.save_and_sample_every == 0:
                 self.ema.ema_model.eval()
                 with torch.no_grad():
-                    # Sample from validation dataset
-                    val_data_dict = self.val_dataset.sample_window(mode='random')
-                    left_hand = val_data_dict['left_hand'].cuda().unsqueeze(0)
-                    right_hand = val_data_dict['right_hand'].cuda().unsqueeze(0)
-                    object_motion = val_data_dict['object_motion'].cuda().unsqueeze(0)
-                    seq_len = val_data_dict['seq_len'].cuda().unsqueeze(0)
-                    
+                    try:
+                        val_batch = next(self.val_iter)
+                    except StopIteration:
+                        self.val_iter = iter(self.val_loader)
+                        val_batch = next(self.val_iter)
+
+                    left_hand = val_batch['left_hand'].cuda()
+                    right_hand = val_batch['right_hand'].cuda()
+                    object_motion = val_batch['object_motion'].cuda()
+                    seq_len = val_batch['seq_len'].cuda()
+                    frame_weights = val_batch['frame_weights'].cuda()
+
                     hand_poses = torch.cat([left_hand, right_hand], dim=-1)
-                    
-                    # Generate validation padding mask (like overfit script)
+
                     actual_seq_len = seq_len + 1
-                    tmp_mask = torch.arange(self.window+1, device='cuda').expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
+                    tmp_mask = torch.arange(self.window+1, device=hand_poses.device).expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
                     padding_mask = tmp_mask[:, None, :]
-                    
-                    val_loss = self.model(object_motion, hand_poses, padding_mask=padding_mask)
+
+                    val_loss = self.model(object_motion, hand_poses, padding_mask=padding_mask, frame_weight=frame_weights)
                     if self.use_wandb:
                         wandb.log({"Validation/Loss": val_loss.item()})
                 
@@ -547,16 +565,12 @@ class Trainer(object):
                 # Store trajectory segment info before restoring absolute coordinates
                 segment_info = {
                     'demo_id': data_dict['demo_id'],
-                    'obj_id': data_dict['obj_id'], 
+                    'obj_id': data_dict['obj_id'],
                     'is_moving': data_dict['is_moving'],
                     'origin': origin.cpu().numpy(),
                     'seq_len': seq_len.cpu().numpy(),
                     's_idx': s_idx
                 }
-
-                # Add the origin back to the predictions and ground truth
-                all_res_list[:, :, :3] += origin.unsqueeze(1)
-                object_motion_gt[:, :, :3] += origin.unsqueeze(1)
 
                 for i in range(all_res_list.shape[0]):
                     pred_motion = all_res_list[i, :seq_len[i]]
@@ -571,8 +585,6 @@ class Trainer(object):
                                                               val_dataset.right_hand_std.to(right_hand.device))
                     
                     # Restore hand poses to original coordinate system
-                    left_hand_denorm[:, :3] += origin[i]
-                    right_hand_denorm[:, :3] += origin[i]
                     hand_poses_restored = torch.cat([left_hand_denorm, right_hand_denorm], dim=-1)
                     
                     # Using position from 9d representation
@@ -593,11 +605,8 @@ class Trainer(object):
                     np.save(os.path.join(dest_folder, "input_hand_poses.npy"), hand_poses_restored.cpu().numpy())
                     
                     # Save enhanced context for better visualization
-                    # Create centered versions for comparison (only subtract origin from position components)
                     centered_gt_motion = gt_motion.clone()
                     centered_pred_motion = pred_motion.clone()
-                    centered_gt_motion[:, :3] -= origin[i]  # Only center the position (first 3 dims)
-                    centered_pred_motion[:, :3] -= origin[i]  # Only center the position (first 3 dims)
                     
                     context_info = {
                         'demo_id': data_dict['demo_id'],
