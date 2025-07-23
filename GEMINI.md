@@ -2,6 +2,8 @@
 
 This document outlines the context for the Gemini AI assistant to effectively collaborate on this project.
 
+Your working directory is: /home/yufeiy2_egorecon/omomo_release, you want to use the venv "omomo_env"
+
 ## User Profile & Goal
 
 - **Role:** Researcher at Stanford AI Lab.

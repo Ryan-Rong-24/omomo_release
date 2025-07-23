@@ -66,9 +66,9 @@ def create_training_video(results_dir, max_frames=None, fps=10, trail_length=20)
         return
     
     print("Loading training results...")
-    sampled_motion = load_numpy_data(sampled_motion_path).squeeze(0)  # [T, 9]
-    ground_truth_object = load_numpy_data(ground_truth_path).squeeze(0)  # [T, 9]
-    input_hand_poses = load_numpy_data(hand_poses_path).squeeze(0)  # [T, 18]
+    sampled_motion = load_numpy_data(sampled_motion_path)  # [T, 9]
+    ground_truth_object = load_numpy_data(ground_truth_path)  # [T, 9]
+    input_hand_poses = load_numpy_data(hand_poses_path)  # [T, 18]
     
     # Split hand poses
     left_hand_poses = input_hand_poses[:, :9]  # [T, 9]
@@ -85,6 +85,10 @@ def create_training_video(results_dir, max_frames=None, fps=10, trail_length=20)
             max_frames = 500
         else:
             max_frames = original_seq_length
+    elif max_frames == -1:
+        # -1 means use all frames, no auto-limiting
+        print(f"Using all {original_seq_length} frames as requested (--max_frames -1)")
+        max_frames = original_seq_length
     
     # Downsample if needed
     if original_seq_length > max_frames:
@@ -344,7 +348,7 @@ def create_training_video(results_dir, max_frames=None, fps=10, trail_length=20)
 def main():
     parser = argparse.ArgumentParser(
         description="Create animated video of training results.",
-        epilog="Note: Very long sequences (>1000 frames) will be automatically downsampled to 500 frames for performance unless --max_frames is specified."
+        epilog="Note: Very long sequences (>1000 frames) will be automatically downsampled to 500 frames for performance unless --max_frames is specified. Use --max_frames -1 to force using all frames."
     )
     parser.add_argument(
         "--results_dir", "-r",
@@ -356,7 +360,7 @@ def main():
         "--max_frames",
         type=int,
         default=None,
-        help="Maximum number of frames to visualize. For sequences >1000 frames, defaults to 500 for performance. Set to -1 to use all frames."
+        help="Maximum number of frames to visualize. For sequences >1000 frames, defaults to 500 for performance. Set to -1 to use all frames (no auto-limiting)."
     )
     parser.add_argument(
         "--fps",
@@ -377,11 +381,8 @@ def main():
         print(f"Error: Results directory {args.results_dir} not found!")
         return
     
-    # Handle -1 as "use all frames"
-    max_frames = None if args.max_frames == -1 else args.max_frames
-    
     create_training_video(args.results_dir, 
-                         max_frames=max_frames, 
+                         max_frames=args.max_frames, 
                          fps=args.fps, 
                          trail_length=args.trail_length)
 

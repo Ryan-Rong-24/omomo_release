@@ -129,8 +129,16 @@ class DecoderLayer(nn.Module):
         # padding_mask: BS X T (padding position are zeros, diff usage from above)
         bs, dec_len, dec_hidden = decoder_input.shape
         
+        bs, dec_len, _ = decoder_input.shape
+        attn_pad_mask = ~self_attn_padding_mask.unsqueeze(1).expand(bs, dec_len, -1)
+
+        if self_attn_time_mask is not None:
+            attn_mask = self_attn_time_mask | attn_pad_mask
+        else:
+            attn_mask = attn_pad_mask
+
         decoder_out, dec_self_attn = self.self_attn(decoder_input, decoder_input, decoder_input, \
-                                mask=self_attn_time_mask)
+                                mask=attn_mask)
         # BS X T X D, BS X T X T
         decoder_out *= self_attn_padding_mask.unsqueeze(-1).float()
         # BS X T X D
