@@ -21,7 +21,6 @@ core
 *.blend*
 .vscode/
 __pycache__
-hot3d/
 human_body_prior/
 venv_gemma/
 venv_gemma3n/
