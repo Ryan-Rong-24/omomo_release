@@ -151,11 +151,16 @@ class CondGaussianDiffusion(nn.Module):
         batch_size=None,
         guidance_weight = 0.0,
         guidance_mode = False,
+        lambda_pos = 10.0,
+        lambda_rot = 1.0,
     ):
         super().__init__()
         self.guidance_weight = guidance_weight
         self.guidance_mode = guidance_mode
         self.clip_denoised = True
+
+        self.lambda_pos = lambda_pos
+        self.lambda_rot = lambda_rot
 
         # Use the passed d_input_feats instead of hardcoding
         self.d_input_feats = d_input_feats
@@ -418,7 +423,7 @@ class CondGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, x_cond, t, noise=None, padding_mask=None):
+    def p_losses(self, x_start, x_cond, t, noise=None, padding_mask=None, frame_weight=None):
         b, timesteps, d_input = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -434,20 +439,36 @@ class CondGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
+        mask = None
         if padding_mask is not None:
-            loss = self.loss_fn(model_out, target, reduction = 'none') * padding_mask[:, 0, 1:][:, :, None]
-        else:
-            loss = self.loss_fn(model_out, target, reduction = 'none')
+            mask = padding_mask[:, 0, 1:][:, :, None]
 
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        pos_out, rot_out = model_out[..., :3], model_out[..., 3:]
+        pos_tgt, rot_tgt = target[..., :3], target[..., 3:]
+
+        pos_loss = self.loss_fn(pos_out, pos_tgt, reduction='none')
+        rot_loss = self.loss_fn(rot_out, rot_tgt, reduction='none')
+
+        if mask is not None:
+            pos_loss = pos_loss * mask
+            rot_loss = rot_loss * mask
+
+        pos_loss = pos_loss.mean(-1)
+        if frame_weight is not None:
+            pos_loss = pos_loss * frame_weight
+        pos_loss = reduce(pos_loss, 'b t -> b', 'mean')
+
+        rot_loss = reduce(rot_loss, 'b t d -> b', 'mean')
+
+        loss = self.lambda_pos * pos_loss + self.lambda_rot * rot_loss
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
-        
+
         return loss.mean()
 
-    def forward(self, x_start, x_cond, cond_mask=None, padding_mask=None):
+    def forward(self, x_start, x_cond, cond_mask=None, padding_mask=None, frame_weight=None):
         bs = x_start.shape[0] 
         t = torch.randint(0, self.num_timesteps, (bs,), device=x_start.device).long()
         
         # Only use hand poses as condition
-        curr_loss = self.p_losses(x_start, x_cond, t, padding_mask=padding_mask)
-        return curr_loss 
+        curr_loss = self.p_losses(x_start, x_cond, t, padding_mask=padding_mask, frame_weight=frame_weight)
+        return curr_loss
