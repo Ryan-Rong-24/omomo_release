@@ -28,7 +28,17 @@ def extract(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+def linear_beta_schedule(timesteps):
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+
 def cosine_beta_schedule(timesteps, s = 0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
@@ -52,17 +62,34 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+class LearnedSinusoidalPosEmb(nn.Module):
+    """ following @crowsonkb 's lead with learned sinusoidal pos emb """
+    """ https://github.com/crowsonkb/v-diffusion-jax/blob/master/diffusion/models/danbooru_128.py#L8 """
+
+    def __init__(self, dim):
+        super().__init__()
+        assert (dim % 2) == 0
+        half_dim = dim // 2
+        self.weights = nn.Parameter(torch.randn(half_dim))
+
+    def forward(self, x):
+        x = rearrange(x, 'b -> b 1')
+        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
+        fouriered = torch.cat((x, fouriered), dim = -1)
+        return fouriered
+        
 class TransformerDiffusionModel(nn.Module):
     def __init__(
         self,
-        d_input_feats,  # Input dimension (18 for hand poses)
-        d_feats,        # Output dimension (9 for object motion)
-        d_model,        # Transformer model dimension
-        n_dec_layers,   # Number of decoder layers
-        n_head,         # Number of attention heads
-        d_k,           # Key dimension
-        d_v,           # Value dimension
-        max_timesteps,  # Maximum sequence length
+        d_input_feats,
+        d_feats,
+        d_model,
+        n_dec_layers,
+        n_head,
+        d_k,
+        d_v,
+        max_timesteps,
     ):
         super().__init__()
         
@@ -76,24 +103,26 @@ class TransformerDiffusionModel(nn.Module):
 
         # Input: BS X D X T 
         # Output: BS X T X D'
-        self.motion_transformer = Decoder(
-            d_feats=d_input_feats + self.d_feats,
-            d_model=self.d_model,
-            n_layers=self.n_dec_layers, 
-            n_head=self.n_head, 
-            d_k=self.d_k, 
-            d_v=self.d_v,
-            max_timesteps=self.max_timesteps, 
-            use_full_attention=True
-        )  
+        self.motion_transformer = Decoder(d_feats=d_input_feats, d_model=self.d_model, \
+            n_layers=self.n_dec_layers, n_head=self.n_head, d_k=self.d_k, d_v=self.d_v, \
+            max_timesteps=self.max_timesteps, use_full_attention=True)  
 
         self.linear_out = nn.Linear(self.d_model, self.d_feats)
 
         # For noise level t embedding
         dim = 64
+        learned_sinusoidal_dim = 16
         time_dim = dim * 4
-        sinu_pos_emb = SinusoidalPosEmb(dim)
-        fourier_dim = dim
+
+        learned_sinusoidal_cond = False
+        self.learned_sinusoidal_cond = learned_sinusoidal_cond
+
+        if learned_sinusoidal_cond:
+            sinu_pos_emb = LearnedSinusoidalPosEmb(learned_sinusoidal_dim)
+            fourier_dim = learned_sinusoidal_dim + 1
+        else:
+            sinu_pos_emb = SinusoidalPosEmb(dim)
+            fourier_dim = dim
 
         self.time_mlp = nn.Sequential(
             sinu_pos_emb,
@@ -103,12 +132,13 @@ class TransformerDiffusionModel(nn.Module):
         )
 
     def forward(self, src, noise_t, condition, padding_mask=None):
-        # src: BS X T X D (noisy object motion)
-        # condition: BS X T X D_cond (hand poses)
-        # noise_t: int (timestep)
+        # src: BS X T X D (noisy object trajectory)
+        # noise_t: BS (timestep)
+        # condition: BS X T X (2*D) (left + right hand poses)
+        # padding_mask: BS X 1 X (T+1)
 
-        # Use only hand poses as condition
-        # src = condition
+        # Concatenate noisy object trajectory with hand pose condition
+        src = torch.cat((src, condition), dim=-1)  # BS X T X (D + 2*D) = BS X T X (3*D)
        
         noise_t_embed = self.time_mlp(noise_t) # BS X d_model 
         noise_t_embed = noise_t_embed[:, None, :] # BS X 1 X d_model 
@@ -117,70 +147,67 @@ class TransformerDiffusionModel(nn.Module):
         num_steps = src.shape[1] + 1
 
         if padding_mask is None:
-            padding_mask = torch.ones(bs, 1, num_steps).to(src.device).bool()
+            # In training, no need for masking 
+            padding_mask = torch.ones(bs, 1, num_steps).to(src.device).bool() # BS X 1 X timesteps
 
-        pos_vec = torch.arange(num_steps)+1
-        pos_vec = pos_vec[None, None, :].to(src.device).repeat(bs, 1, 1)
+        # Get position vec for position-wise embedding
+        pos_vec = torch.arange(num_steps)+1 # timesteps
+        pos_vec = pos_vec[None, None, :].to(src.device).repeat(bs, 1, 1) # BS X 1 X timesteps
 
-        data_input = torch.cat([src.transpose(1, 2), condition.transpose(1, 2)], dim=1)
+        data_input = src.transpose(1, 2).detach() # BS X (3*D) X T 
         feat_pred, _ = self.motion_transformer(data_input, padding_mask, pos_vec, obj_embedding=noise_t_embed)
-        
-        output = self.linear_out(feat_pred[:, 1:])
 
-        return output
+        output = self.linear_out(feat_pred[:, 1:]) # BS X T X D (predict object trajectory)
+
+        return output # predicted noise or x0, same size as target object trajectory
 
 class CondGaussianDiffusion(nn.Module):
     def __init__(
         self,
         opt,
-        d_feats,        # Output dimension (9 for object motion)
-        d_model,        # Transformer model dimension
-        n_head,         # Number of attention heads
-        n_dec_layers,   # Number of decoder layers
-        d_k,           # Key dimension
-        d_v,           # Value dimension
-        max_timesteps,  # Maximum sequence length
-        out_dim,       # Output dimension
-        d_input_feats=18,  # Input dimension (18 for 9D hands, 24 for 12D hands)
+        d_feats,
+        d_model,
+        n_head,
+        n_dec_layers,
+        d_k,
+        d_v,
+        max_timesteps,
+        out_dim,
         timesteps = 1000,
         loss_type = 'l1',
-        objective = 'pred_x0',
+        objective = 'pred_noise',
         beta_schedule = 'cosine',
-        p2_loss_weight_gamma = 0.,
+        p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k = 1,
         batch_size=None,
-        guidance_weight = 0.0,
-        guidance_mode = False,
-        lambda_pos = 10.0,
-        lambda_rot = 1.0,
     ):
         super().__init__()
-        self.guidance_weight = guidance_weight
-        self.guidance_mode = guidance_mode
-        self.clip_denoised = True
 
-        self.lambda_pos = lambda_pos
-        self.lambda_rot = lambda_rot
-
-        # Use the passed d_input_feats instead of hardcoding
-        self.d_input_feats = d_input_feats
+        # For hand-to-object task:
+        # d_feats = output object trajectory dimension (9 or 12)
+        # condition_dim = input hand poses dimension (2 * d_feats for left + right hand)
+        condition_dim = 2 * d_feats  # Left hand + Right hand
+        d_input_feats = d_feats + condition_dim  # Object trajectory + hand poses
             
         self.denoise_fn = TransformerDiffusionModel(
-            d_input_feats=d_input_feats,
-            d_feats=d_feats,
-            d_model=d_model,
+            d_input_feats=d_input_feats, 
+            d_feats=d_feats, 
+            d_model=d_model, 
             n_head=n_head,
-            d_k=d_k,
-            d_v=d_v,
-            n_dec_layers=n_dec_layers,
+            d_k=d_k, 
+            d_v=d_v, 
+            n_dec_layers=n_dec_layers, 
             max_timesteps=max_timesteps
-        )
+        ) 
         
         self.objective = objective
+
         self.seq_len = max_timesteps - 1 
         self.out_dim = out_dim 
 
-        if beta_schedule == 'cosine':
+        if beta_schedule == 'linear':
+            betas = linear_beta_schedule(timesteps)
+        elif beta_schedule == 'cosine':
             betas = cosine_beta_schedule(timesteps)
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
@@ -193,11 +220,15 @@ class CondGaussianDiffusion(nn.Module):
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
+        # helper function to register buffer from float64 to float32
+
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
 
         register_buffer('betas', betas)
         register_buffer('alphas_cumprod', alphas_cumprod)
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
 
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
@@ -205,11 +236,21 @@ class CondGaussianDiffusion(nn.Module):
         register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
         register_buffer('posterior_variance', posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
         register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        # calculate p2 reweighting
 
         register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
@@ -217,12 +258,6 @@ class CondGaussianDiffusion(nn.Module):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
-        )
-
-    def predict_noise_from_start(self, x_t, t, x0):
-        return (
-            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
     def q_posterior(self, x_start, x_t, t):
@@ -234,181 +269,67 @@ class CondGaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, cond, t, weight=None, clip_x_start=False, nn_cond=None):
-        model_output = self.denoise_fn(x, t, cond, None)
-        if self.objective == 'pred_noise':
-            pred_noise = model_output
-            x_start = self.predict_start_from_noise(x, t, pred_noise)
-            if clip_x_start:
-                x_start.clamp_(-1., 1.)
+    def p_mean_variance(self, x, t, x_cond, padding_mask, clip_denoised):
+        model_output = self.denoise_fn(x, t, x_cond, padding_mask)
 
+        if self.objective == 'pred_noise':
+            x_start = self.predict_start_from_noise(x, t = t, noise = model_output)
         elif self.objective == 'pred_x0':
             x_start = model_output
-            if clip_x_start:
-                x_start.clamp_(-1., 1.)
-            pred_noise = self.predict_noise_from_start(x, t, x_start)
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
 
-        return pred_noise, x_start
-
-    def p_mean_variance(self, x, t, x_cond, padding_mask, clip_denoised):
-        pred_noise, x_start = self.model_predictions(x, x_cond, t, clip_x_start=clip_denoised)
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x, t=t)
-        return model_mean, posterior_variance, posterior_log_variance, x_start
+        return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
     def p_sample(self, x, t, x_cond, padding_mask=None, clip_denoised=True):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance, _ = self.p_mean_variance(x=x, t=t, x_cond=x_cond,             padding_mask=padding_mask, clip_denoised=clip_denoised)
+        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, x_cond=x_cond, \
+            padding_mask=padding_mask, clip_denoised=clip_denoised)
         noise = torch.randn_like(x)
+        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
-    def long_ddim_sample(self, shape, cond, **model_kwargs):
-        batch, device, total_timesteps, sampling_timesteps, eta = (
-            shape[0],
-            self.betas.device,
-            self.num_timesteps,
-            50,
-            1,
-        )
-
-        if batch == 1:
-            return self.ddim_sample(shape, cond)
-
-        times = torch.linspace(
-            -1, total_timesteps - 1, steps=sampling_timesteps + 1
-        )  # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = list(reversed(times.int().tolist()))
-        weights = np.clip(
-            np.linspace(0, self.guidance_weight * 2, sampling_timesteps),
-            None,
-            self.guidance_weight,
-        )
-        time_pairs = list(
-            zip(times[:-1], times[1:], weights)
-        )  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-
-        x = torch.randn(shape, device=device)
-        cond = cond.to(device)
-
-        assert batch > 1
-        assert x.shape[1] % 2 == 0
-        half = x.shape[1] // 2
-
-        x_start = None
-
-        for time, time_next, weight in tqdm(time_pairs, desc="sampling loop time step"):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start = self.model_predictions(
-                x, cond, time_cond, weight=weight, clip_x_start=self.clip_denoised, nn_cond=model_kwargs.get('nn_cond', None)
-            )
-
-            if time_next < 0:
-                x = x_start
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-
-            sigma = (
-                eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            )
-            c = (1 - alpha_next - sigma**2).sqrt()
-
-            noise = torch.randn_like(x)
-
-            model_mean = x_start * alpha_next.sqrt() + c * pred_noise
-
-            if self.guidance_mode:
-                print('guide')
-                # spatial guidance/classifier guidance
-                time_next_cond = torch.full((batch,), time_next, device=device, dtype=torch.long)
-                model_mean_guide = self.guide(model_mean, time_next_cond, model_kwargs=model_kwargs, ddim=True, train=False)
-                model_mean = model_mean_guide
-
-            x = model_mean + sigma * noise
-            if time > 0:
-                # the first half of each sequence is the second half of the previous one
-                x[1:, :half] = x[:-1, half:]
-        return x
-
-    @torch.no_grad()
-    def ddim_sample(self, shape, cond, **model_kwargs):
-        batch, device, total_timesteps, sampling_timesteps, eta = (
-            shape[0],
-            self.betas.device,
-            self.num_timesteps,
-            50,
-            1,
-        )
-
-        times = torch.linspace(
-            -1, total_timesteps - 1, steps=sampling_timesteps + 1
-        )  # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(
-            zip(times[:-1], times[1:])
-        )  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-
-        x = torch.randn(shape, device=device)
-        cond = cond.to(device)
-
-        x_start = None
-
-        for time, time_next in tqdm(time_pairs, desc="sampling loop time step"):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start = self.model_predictions(
-                x, cond, time_cond, clip_x_start=self.clip_denoised, nn_cond=model_kwargs.get('nn_cond', None)
-            )
-
-            if time_next < 0:
-                x = x_start
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-
-            sigma = (
-                eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            )
-            c = (1 - alpha_next - sigma**2).sqrt()
-
-            noise = torch.randn_like(x)
-
-            model_mean = x_start * alpha_next.sqrt() + c * pred_noise
-
-            x = model_mean + sigma * noise
-
-        return x
-
-    @torch.no_grad()
     def p_sample_loop(self, shape, x_start, x_cond, padding_mask=None):
         device = self.betas.device
+
         b = shape[0]
         x = torch.randn(shape, device=device)
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             x = self.p_sample(x, torch.full((b,), i, device=device, dtype=torch.long), x_cond, padding_mask=padding_mask)    
 
-        return x
+        return x # BS X T X D
 
     @torch.no_grad()
-    def sample(self, x_start, x_cond, cond_mask=None, padding_mask=None):
-        self.denoise_fn.eval()
+    def sample(self, x_start, hand_condition, cond_mask=None, padding_mask=None):
+        """
+        Sample object trajectory conditioned on hand poses.
         
-        if cond_mask is not None:
-            x_pose_cond = x_start * (1. - cond_mask) + cond_mask * torch.randn_like(x_start).to(x_start.device)
-            x_cond = torch.cat((x_cond, x_pose_cond), dim=-1)
-       
-        sample_res = self.p_sample_loop(x_start.shape, x_start, x_cond, padding_mask)
+        Args:
+            x_start: BS X T X D - initial object trajectory (can be noise)
+            hand_condition: BS X T X (2*D) - left and right hand trajectories
+            cond_mask: optional mask for conditional generation
+            padding_mask: BS X 1 X (T+1) - mask for variable sequence lengths
+        """
+        self.denoise_fn.eval() 
+
+        sample_res = self.p_sample_loop(x_start.shape, x_start, hand_condition, padding_mask)
+        # BS X T X D
             
         self.denoise_fn.train()
-        return sample_res
+
+        return sample_res  
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
+
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
@@ -423,13 +344,22 @@ class CondGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, x_cond, t, noise=None, padding_mask=None, frame_weight=None):
-        b, timesteps, d_input = x_start.shape
+    def p_losses(self, x_start, x_cond, t, noise=None, padding_mask=None):
+        """
+        Compute diffusion losses.
+        
+        Args:
+            x_start: BS X T X D - ground truth object trajectory
+            x_cond: BS X T X (2*D) - hand pose condition (left + right)
+            t: BS - noise timesteps
+            noise: BS X T X D - optional noise (will be generated if None)
+            padding_mask: BS X 1 X (T+1) - optional padding mask
+        """
+        b, timesteps, d_input = x_start.shape # BS X T X D
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x = self.q_sample(x_start=x_start, t=t, noise=noise) # noisy object trajectory
 
-        # The model_out should be the predicted noise
         model_out = self.denoise_fn(x, t, x_cond, padding_mask)
 
         if self.objective == 'pred_noise':
@@ -439,36 +369,31 @@ class CondGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        mask = None
         if padding_mask is not None:
-            mask = padding_mask[:, 0, 1:][:, :, None]
+            loss = self.loss_fn(model_out, target, reduction = 'none') * padding_mask[:, 0, 1:][:, :, None]
+        else:
+            loss = self.loss_fn(model_out, target, reduction = 'none') # BS X T X D 
 
-        pos_out, rot_out = model_out[..., :3], model_out[..., 3:]
-        pos_tgt, rot_tgt = target[..., :3], target[..., 3:]
+        loss = reduce(loss, 'b ... -> b (...)', 'mean') # BS X (T*D)
 
-        pos_loss = self.loss_fn(pos_out, pos_tgt, reduction='none')
-        rot_loss = self.loss_fn(rot_out, rot_tgt, reduction='none')
-
-        if mask is not None:
-            pos_loss = pos_loss * mask
-            rot_loss = rot_loss * mask
-
-        pos_loss = pos_loss.mean(-1)
-        if frame_weight is not None:
-            pos_loss = pos_loss * frame_weight
-        pos_loss = reduce(pos_loss, 'b t -> b', 'mean')
-
-        rot_loss = reduce(rot_loss, 'b t d -> b', 'mean')
-
-        loss = self.lambda_pos * pos_loss + self.lambda_rot * rot_loss
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
-
+        
         return loss.mean()
 
-    def forward(self, x_start, x_cond, cond_mask=None, padding_mask=None, frame_weight=None):
+    def forward(self, x_start, hand_condition, cond_mask=None, padding_mask=None):
+        """
+        Forward pass for training.
+        
+        Args:
+            x_start: BS X T X D - ground truth object trajectory
+            hand_condition: BS X T X (2*D) - hand pose condition (left + right)
+            cond_mask: optional conditioning mask
+            padding_mask: BS X 1 X (T+1) - optional padding mask
+        """
         bs = x_start.shape[0] 
         t = torch.randint(0, self.num_timesteps, (bs,), device=x_start.device).long()
-        
-        # Only use hand poses as condition
-        curr_loss = self.p_losses(x_start, x_cond, t, padding_mask=padding_mask, frame_weight=frame_weight)
+
+        curr_loss = self.p_losses(x_start, hand_condition, t, padding_mask=padding_mask)
+
         return curr_loss
+        

@@ -6,8 +6,8 @@ trimesh
 scipy 
 scikit-learn 
 scikit-image 
-scenepic==1.0.8
-torchgeometry==0.1.2
+scenepic==1.1.1
+torchgeometry
 wandb==0.12.21
 ema-pytorch==0.0.10
 einops==0.4.1

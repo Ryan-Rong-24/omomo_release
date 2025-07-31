@@ -3,381 +3,71 @@ import os
 import numpy as np
 import yaml
 import random
-import json
+import json 
+
+import trimesh 
+
 from tqdm import tqdm
 from pathlib import Path
+
 import wandb
-import pickle
 
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils import data
+
+import torch.nn.functional as F
+
+import pytorch3d.transforms as transforms 
 
 from ema_pytorch import EMA
+from multiprocessing import cpu_count
 
-from manip.model.transformer_hand_to_object_diffusion_model import CondGaussianDiffusion
-from evaluation_metrics import compute_metrics 
+# Import the new dataset
+from manip.data.hand_to_object_dataset import HandToObjectDataset
+
+from manip.model.transformer_hand_to_object_diffusion_model import CondGaussianDiffusion 
+
 from matplotlib import pyplot as plt
-from visualize_training_results_video import create_training_video
 
-def load_pickle(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+from manip.vis.trajectory_to_mesh_visualizer import TrajectoryMeshVisualizer
 
-class HandToObjectDataset(Dataset):
-    def __init__(self, data_path, window=128, train=True, velocity_threshold=0.02, balance_ratio=0.5, max_oversample_ratio=5.0):
-        self.window = window
-        self.data_path = data_path
-        self.train = train
-        self.velocity_threshold = velocity_threshold
-        self.balance_ratio = balance_ratio
-        self.max_oversample_ratio = max_oversample_ratio
+# Add learning rate scheduler import
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
-        print(f"Loading data from {data_path}...")
-        processed_data = load_pickle(data_path)
-        
-        all_demo_ids = list(processed_data.keys())
-        random.shuffle(all_demo_ids)
-        
-        split_ratio = 0.8
-        if self.train:
-            self.demo_ids = all_demo_ids[:int(len(all_demo_ids) * split_ratio)]
-        else:
-            self.demo_ids = all_demo_ids[int(len(all_demo_ids) * split_ratio):]
-
-        self.moving_windows = []
-        self.stationary_windows = []
-        self.pose_dim = 9  # Set early
-        self._prepare_interaction_windows(processed_data)
-
-        # Get normalization stats
-        all_left_hand_data = [d['left_hand'] for d in self.moving_windows + self.stationary_windows]
-        all_right_hand_data = [d['right_hand'] for d in self.moving_windows + self.stationary_windows]
-        all_object_motion_data = [d['object_motion'] for d in self.moving_windows + self.stationary_windows]
-
-        self.left_hand_mean, self.left_hand_std = self.get_normalization_stats(all_left_hand_data)
-        self.right_hand_mean, self.right_hand_std = self.get_normalization_stats(all_right_hand_data)
-        self.object_motion_mean, self.object_motion_std = self.get_normalization_stats(all_object_motion_data)
-
-        # Normalize the data
-        for i in range(len(self.moving_windows)):
-            self.moving_windows[i]['left_hand'] = self.normalize(self.moving_windows[i]['left_hand'], self.left_hand_mean, self.left_hand_std)
-            self.moving_windows[i]['right_hand'] = self.normalize(self.moving_windows[i]['right_hand'], self.right_hand_mean, self.right_hand_std)
-            self.moving_windows[i]['object_motion'] = self.normalize(self.moving_windows[i]['object_motion'], self.object_motion_mean, self.object_motion_std)
-
-        for i in range(len(self.stationary_windows)):
-            self.stationary_windows[i]['left_hand'] = self.normalize(self.stationary_windows[i]['left_hand'], self.left_hand_mean, self.left_hand_std)
-            self.stationary_windows[i]['right_hand'] = self.normalize(self.stationary_windows[i]['right_hand'], self.right_hand_mean, self.right_hand_std)
-            self.stationary_windows[i]['object_motion'] = self.normalize(self.stationary_windows[i]['object_motion'], self.object_motion_mean, self.object_motion_std)
-
-        self._balance_dataset()
-
-        # For sequential sampling like in overfit script
-        self.current_window_idx = 0
-
-    def get_normalization_stats(self, data):
-        # data is a list of tensors
-        data = torch.cat(data, dim=0)
-        mean = torch.mean(data, dim=0)
-        std = torch.std(data, dim=0)
-        # Add a small epsilon to std to avoid division by zero
-        std[std == 0] = 1e-6
-        return mean, std
-
-    def normalize(self, data, mean, std):
-        return (data - mean) / std
-
-    def denormalize(self, data, mean, std):
-        return data * std + mean
-
-    def _prepare_interaction_windows(self, processed_data):
-        for demo_id in self.demo_ids:
-            demo_data = processed_data[demo_id]
-            objects_data = demo_data['objects']
-            
-            for obj_id in objects_data.keys():
-                left_hand_data = demo_data['left_hand']['poses_9d']
-                right_hand_data = demo_data['right_hand']['poses_9d']
-                object_data = objects_data[obj_id]['poses_9d']
-
-                min_length = min(len(left_hand_data), len(right_hand_data), len(object_data))
-
-                object_positions = object_data[:min_length, :3]
-                velocities = np.linalg.norm(np.diff(object_positions, axis=0), axis=1)
-                in_motion = velocities > self.velocity_threshold
-
-                # Find contiguous blocks of motion
-                motion_blocks = []
-                stationary_blocks = []
-                
-                # Track motion state
-                current_state = in_motion[0] if len(in_motion) > 0 else False
-                start_idx = 0
-                
-                for i in range(1, len(in_motion)):
-                    if in_motion[i] != current_state:
-                        if current_state:
-                            motion_blocks.append((start_idx, i))
-                        else:
-                            stationary_blocks.append((start_idx, i))
-                        start_idx = i
-                        current_state = in_motion[i]
-                
-                # Handle the last block
-                if current_state:
-                    motion_blocks.append((start_idx, len(in_motion)))
-                else:
-                    stationary_blocks.append((start_idx, len(in_motion)))
-
-                # Process moving windows
-                for start, end in motion_blocks:
-                    self._extract_windows_from_segment(
-                        left_hand_data, right_hand_data, object_data, 
-                        start, end, demo_id, obj_id, is_moving=True
-                    )
-                
-                # Process stationary windows
-                for start, end in stationary_blocks:
-                    self._extract_windows_from_segment(
-                        left_hand_data, right_hand_data, object_data, 
-                        start, end, demo_id, obj_id, is_moving=False
-                    )
-
-    def _extract_windows_from_segment(self, left_hand_data, right_hand_data, object_data, 
-                                     start, end, demo_id, obj_id, is_moving=True):
-        """Extract windows from a segment, handling both short and long segments."""
-        actual_len = end - start
-        
-        # Skip segments that are too short
-        if actual_len < 30:
-            return
-        
-        # For segments shorter than window size, create one window
-        if actual_len <= self.window:
-            window_dict = self._create_window(
-                left_hand_data[start:end], 
-                right_hand_data[start:end], 
-                object_data[start:end], 
-                actual_len, demo_id, obj_id, is_moving
-            )
-            
-            if is_moving:
-                self.moving_windows.append(window_dict)
-            else:
-                self.stationary_windows.append(window_dict)
-        else:
-            # For long segments, create multiple overlapping windows
-            step_size = self.window // 2  # 50% overlap
-            
-            for window_start in range(0, actual_len - 30 + 1, step_size):
-                window_end = min(window_start + self.window, actual_len)
-                window_len = window_end - window_start
-                
-                if window_len < 30:
-                    break
-                
-                segment_start = start + window_start
-                segment_end = start + window_end
-                
-                window_dict = self._create_window(
-                    left_hand_data[segment_start:segment_end], 
-                    right_hand_data[segment_start:segment_end], 
-                    object_data[segment_start:segment_end], 
-                    window_len, demo_id, obj_id, is_moving
-                )
-                
-                if is_moving:
-                    self.moving_windows.append(window_dict)
-                else:
-                    self.stationary_windows.append(window_dict)
-    
-    def _create_window(self, left_hand, right_hand, object_motion, actual_len, demo_id, obj_id, is_moving=True):
-        """Create a window dictionary with proper padding."""
-        # Ensure actual_len doesn't exceed window size (safety check)
-        actual_len = min(actual_len, self.window)
-        
-        left_hand = torch.tensor(left_hand, dtype=torch.float32)
-        right_hand = torch.tensor(right_hand, dtype=torch.float32)
-        object_motion = torch.tensor(object_motion, dtype=torch.float32)
-        
-        # Truncate if too long
-        if left_hand.shape[0] > self.window:
-            left_hand = left_hand[:self.window]
-            right_hand = right_hand[:self.window]
-            object_motion = object_motion[:self.window]
-
-        # Store the object's origin but keep all data in world coordinates
-        origin = torch.zeros(3, dtype=torch.float32)
-        if actual_len > 0:
-            origin = object_motion[0, :3].clone()
-
-        # Frame level weights based on velocity magnitude (before padding)
-        frame_weights = torch.ones(self.window, dtype=torch.float32)
-        if actual_len > 1:
-            vel = torch.norm(object_motion[1:actual_len, :3] - object_motion[:actual_len-1, :3], dim=1)
-            w = 1.0 + 9.0 * (vel > 0.04).float()
-            frame_weights[1:actual_len] = w
-            frame_weights[0] = frame_weights[1]
-
-        if actual_len < self.window:
-            frame_weights[actual_len:] = 0.0
-        
-        # Pad if necessary
-        if actual_len < self.window:
-            pad_len = self.window - actual_len
-            left_hand = torch.cat([left_hand, torch.zeros(pad_len, self.pose_dim)], dim=0)
-            right_hand = torch.cat([right_hand, torch.zeros(pad_len, self.pose_dim)], dim=0)
-            object_motion = torch.cat([object_motion, torch.zeros(pad_len, self.pose_dim)], dim=0)
-        
-        return {
-            'left_hand': left_hand,
-            'right_hand': right_hand,
-            'object_motion': object_motion,
-            'seq_len': torch.tensor(actual_len),
-            'demo_id': demo_id,
-            'obj_id': obj_id,
-            'is_moving': is_moving,
-            'origin': origin,
-            'frame_weights': frame_weights
-        }
-    
-    def _balance_dataset(self):
-        """Balance the dataset by sampling moving and stationary windows."""
-        print(f"Dataset statistics before balancing:")
-        print(f"  Moving windows: {len(self.moving_windows)}")
-        print(f"  Stationary windows: {len(self.stationary_windows)}")
-        
-        if len(self.moving_windows) == 0 or len(self.stationary_windows) == 0:
-            print("Warning: No moving or stationary windows found!")
-            self.window_data = self.moving_windows + self.stationary_windows
-            return
-        
-        # Calculate target sizes
-        total_moving = len(self.moving_windows)
-        total_stationary = len(self.stationary_windows)
-        
-        # Check if we should use less aggressive oversampling
-        max_oversample_ratio = getattr(self, 'max_oversample_ratio', 5.0)
-        
-        if self.balance_ratio == 0.5:
-            # For 50% balance, check if oversampling would be too aggressive
-            if total_stationary > total_moving * max_oversample_ratio:
-                print(f"Warning: Reducing target to avoid excessive oversampling (>{max_oversample_ratio}x)")
-                # Instead of matching stationary, limit oversampling
-                target_moving = min(total_stationary, int(total_moving * max_oversample_ratio))
-                target_stationary = target_moving
-            else:
-                target_size = min(total_moving, total_stationary)
-                target_moving = target_size
-                target_stationary = target_size
-        else:
-            # Custom balance ratio with oversampling limits
-            total_target = max(total_moving, total_stationary)
-            target_moving = int(total_target * self.balance_ratio)
-            target_stationary = int(total_target * (1 - self.balance_ratio))
-            
-            # Apply oversampling limits
-            if target_moving > total_moving * max_oversample_ratio:
-                target_moving = int(total_moving * max_oversample_ratio)
-                print(f"Limited moving oversampling to {max_oversample_ratio}x")
-            
-            if target_stationary > total_stationary * max_oversample_ratio:
-                target_stationary = int(total_stationary * max_oversample_ratio)
-                print(f"Limited stationary oversampling to {max_oversample_ratio}x")
-        
-        # Sample balanced windows (with replacement if needed)
-        if target_moving > 0:
-            if target_moving <= total_moving:
-                # Sample without replacement
-                selected_moving = random.sample(self.moving_windows, target_moving)
-            else:
-                # Sample with replacement (oversample)
-                selected_moving = random.choices(self.moving_windows, k=target_moving)
-        else:
-            selected_moving = []
-            
-        if target_stationary > 0:
-            if target_stationary <= total_stationary:
-                # Sample without replacement
-                selected_stationary = random.sample(self.stationary_windows, target_stationary)
-            else:
-                # Sample with replacement (oversample)
-                selected_stationary = random.choices(self.stationary_windows, k=target_stationary)
-        else:
-            selected_stationary = []
-        
-        # Combine and shuffle
-        self.window_data = selected_moving + selected_stationary
-        random.shuffle(self.window_data)
-        
-        print(f"Dataset statistics after balancing:")
-        print(f"  Selected moving windows: {len(selected_moving)}")
-        print(f"  Selected stationary windows: {len(selected_stationary)}")
-        print(f"  Total windows: {len(self.window_data)}")
-        if len(self.window_data) > 0:
-            print(f"  Moving ratio: {len(selected_moving) / len(self.window_data) * 100:.1f}%")
-        print(f"  Velocity threshold: {self.velocity_threshold}")
-        
-        # Report oversampling ratios
-        if len(selected_moving) > total_moving:
-            oversample_ratio = len(selected_moving) / total_moving
-            print(f"  Moving oversampling ratio: {oversample_ratio:.1f}x")
-        if len(selected_stationary) > total_stationary:
-            oversample_ratio = len(selected_stationary) / total_stationary  
-            print(f"  Stationary oversampling ratio: {oversample_ratio:.1f}x")
-
-    def sample_window(self, mode='random'):
-        """Sample a window from pre-computed windows (like in overfit script)."""
-        if len(self.window_data) == 0:
-            raise ValueError("No windows available")
-        
-        if mode == 'random':
-            # Random sampling
-            idx = random.randint(0, len(self.window_data) - 1)
-        elif mode == 'sequential':
-            # Sequential sampling
-            idx = self.current_window_idx
-            self.current_window_idx = (self.current_window_idx + 1) % len(self.window_data)
-        else:
-            raise ValueError(f"Unknown sampling mode: {mode}")
-        
-        return self.window_data[idx]
-
-    def __len__(self):
-        return len(self.window_data)
-
-    def __getitem__(self, index):
-        return self.window_data[index]
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
 
 class Trainer(object):
     def __init__(
         self,
         opt,
         diffusion_model,
-        train_dataset,
-        val_dataset,
         *,
         ema_decay=0.995,
         train_batch_size=32,
         train_lr=1e-4,
-        train_num_steps=100000,
+        train_num_steps=10000000,
         gradient_accumulate_every=2,
         amp=False,
         step_start_ema=2000,
         ema_update_every=10,
-        save_and_sample_every=1000,
+        save_and_sample_every=10000,
         results_folder='./results',
-        use_wandb=True,
-        use_weighted_loss=False,
-        moving_weight=1.0
+        use_wandb=True,  
     ):
         super().__init__()
 
-        self.use_wandb = use_wandb
+        self.use_wandb = use_wandb           
         if self.use_wandb:
-            wandb.init(config=opt, project=opt.wandb_pj_name, entity=opt.entity, name=opt.exp_name, dir=opt.save_dir)
+            # Loggers
+            wandb.init(config=opt, project=opt.wandb_pj_name, entity=opt.entity, \
+            name=opt.exp_name, dir=opt.save_dir)
 
         self.model = diffusion_model
         self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
@@ -389,27 +79,89 @@ class Trainer(object):
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
 
-        self.optimizer = Adam(diffusion_model.parameters(), lr=train_lr)
+        self.optimizer = Adam(diffusion_model.parameters(), lr=train_lr, weight_decay=1e-4)
+
+        # Add learning rate scheduler
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=train_num_steps, eta_min=1e-6)
+        
+        # Alternative: ReduceLROnPlateau scheduler
+        # self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=1000, min_lr=1e-6)
+
         self.step = 0
+        
+        # Add warmup period
+        self.warmup_steps = 1000
+        self.warmup_lr = train_lr * 0.1  # Start with 10% of target LR
+
         self.amp = amp
         self.scaler = GradScaler(enabled=amp)
 
         self.results_folder = results_folder
+
         self.vis_folder = results_folder.replace("weights", "vis_res")
-        self.opt = opt
+
+        self.opt = opt 
+
         self.window = opt.window
+        self.use_velocity = getattr(opt, 'use_velocity', False)
         
-        # Keep datasets and create dataloaders for stable batching
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, drop_last=True)
-        self.val_loader = DataLoader(val_dataset, batch_size=train_batch_size, shuffle=False)
-        self.train_iter = iter(self.train_loader)
-        self.val_iter = iter(self.val_loader)
+        self.data_root_folder = self.opt.data_root_folder 
+
+        self.prep_dataloader(window_size=opt.window)
+
+        self.test_on_train = getattr(self.opt, 'test_sample_res_on_train', False)
+        self.for_quant_eval = getattr(self.opt, 'for_quant_eval', False)
+
+        # Add gradient clipping
+        self.max_grad_norm = getattr(opt, 'max_grad_norm', 1.0)
         
-        # Weighted loss parameters
-        self.use_weighted_loss = use_weighted_loss
-        self.moving_weight = moving_weight
+        # Add loss tracking for better monitoring
+        self.loss_history = []
+        self.val_loss_history = []
+
+    def check_model_nan(self):
+        """Check if any model parameters are NaN."""
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                print(f'WARNING: NaN detected in model parameter {name}')
+                return True
+        return False
+
+    def prep_dataloader(self, window_size):
+        # Define dataset using the new HandToObjectDataset
+        train_dataset = HandToObjectDataset(
+            data_path=self.data_root_folder,
+            window_size=window_size,
+            use_velocity=self.use_velocity,
+            sampling_strategy=self.opt.sampling_strategy,
+            motion_threshold=self.opt.motion_threshold,
+            min_motion_frames=self.opt.min_motion_frames,
+            augment=True  # Enable data augmentation for training
+        )
+        
+        # Create validation dataset (using different sampling or subset)
+        val_dataset = HandToObjectDataset(
+            data_path=self.data_root_folder,
+            window_size=window_size,
+            use_velocity=self.use_velocity,
+            sampling_strategy=self.opt.sampling_strategy,  # Use same strategy for validation
+            motion_threshold=self.opt.motion_threshold,
+            min_motion_frames=self.opt.min_motion_frames,
+            augment=False  # No augmentation for validation
+        )
+
+        self.ds = train_dataset 
+        self.val_ds = val_dataset
+        
+        self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, \
+            shuffle=True, pin_memory=True, num_workers=4))
+        self.val_dl = cycle(data.DataLoader(self.val_ds, batch_size=self.batch_size, \
+            shuffle=False, pin_memory=True, num_workers=4))
+
+        print(f"Training dataset size: {len(self.ds)}")
+        print(f"Validation dataset size: {len(self.val_ds)}")
+        print(f"Data dimensions: {self.ds.pose_dim}D")
+        print(f"Using velocity: {self.use_velocity}")
 
     def save(self, milestone):
         data = {
@@ -418,11 +170,11 @@ class Trainer(object):
             'ema': self.ema.state_dict(),
             'scaler': self.scaler.state_dict()
         }
-        torch.save(data, os.path.join(self.results_folder, f'model-{milestone}.pt'))
+        torch.save(data, os.path.join(self.results_folder, 'model-'+str(milestone)+'.pt'))
 
     def load(self, milestone, pretrained_path=None):
         if pretrained_path is None:
-            data = torch.load(os.path.join(self.results_folder, f'model-{milestone}.pt'))
+            data = torch.load(os.path.join(self.results_folder, 'model-'+str(milestone)+'.pt'))
         else:
             data = torch.load(pretrained_path)
 
@@ -432,81 +184,251 @@ class Trainer(object):
         self.scaler.load_state_dict(data['scaler'])
 
     def train(self):
-        for idx in range(self.train_num_steps):
+        init_step = self.step 
+        for idx in range(init_step, self.train_num_steps):
             self.optimizer.zero_grad()
 
+            nan_exists = False # If met nan in loss or gradient, need to skip to next data. 
+            accumulated_loss = 0.0
+            accumulated_grad_norm = 0.0
+            
             for i in range(self.gradient_accumulate_every):
-                try:
-                    batch = next(self.train_iter)
-                except StopIteration:
-                    self.train_iter = iter(self.train_loader)
-                    batch = next(self.train_iter)
+                data_dict = next(self.dl)
+                
+                # Extract data from the new dataset format
+                condition = data_dict['condition'].cuda()  # [BS, T, 2*D] - left + right hand
+                target = data_dict['target'].cuda()        # [BS, T, D] - object trajectory
+                
+                bs, num_steps, _ = target.shape
 
-                left_hand = batch['left_hand'].cuda()
-                right_hand = batch['right_hand'].cuda()
-                object_motion = batch['object_motion'].cuda()
-                seq_len = batch['seq_len'].cuda()
-                frame_weights = batch['frame_weights'].cuda()
-
-                hand_poses = torch.cat([left_hand, right_hand], dim=-1)
-
-                # Generate padding mask (like overfit script)
-                actual_seq_len = seq_len + 1
-                tmp_mask = torch.arange(self.window+1, device=hand_poses.device).expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
+                # Generate padding mask - using fixed window size for now
+                # In the new dataset, all windows are the same size
+                seq_len = torch.full((bs,), num_steps, dtype=torch.long, device=target.device)
+                actual_seq_len = seq_len + 1  # Add 1 for noise level timestep
+                tmp_mask = torch.arange(self.window+1, device=target.device).expand(bs, self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
                 padding_mask = tmp_mask[:, None, :]
 
-                with autocast(enabled=self.amp):
-                    loss = self.model(object_motion, hand_poses, padding_mask=padding_mask, frame_weight=frame_weights)
-
-                    if self.use_weighted_loss and 'is_moving' in batch:
-                        is_moving = batch['is_moving'].cuda()
-                        # Apply weighted loss and then take mean to ensure it's a scalar
-                        weighted_loss = loss * (1 + (self.moving_weight - 1) * is_moving.float())
-                        loss = weighted_loss.mean()
+                with autocast(enabled = self.amp):    
+                    loss_diffusion = self.model(target, condition, padding_mask=padding_mask)
                     
+                    loss = loss_diffusion
+
+                    if torch.isnan(loss).item():
+                        print('WARNING: NaN loss. Skipping to next data...')
+                        print(f'  Target range: [{target.min():.6f}, {target.max():.6f}]')
+                        print(f'  Condition range: [{condition.min():.6f}, {condition.max():.6f}]')
+                        nan_exists = True 
+                        torch.cuda.empty_cache()
+                        continue
+
+                    # Check for inf loss as well
+                    if torch.isinf(loss).item():
+                        print('WARNING: Inf loss. Skipping to next data...')
+                        print(f'  Target range: [{target.min():.6f}, {target.max():.6f}]')
+                        print(f'  Condition range: [{condition.min():.6f}, {condition.max():.6f}]')
+                        nan_exists = True 
+                        torch.cuda.empty_cache()
+                        continue
+
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
-                if self.use_wandb:
-                    log_dict = {"Train/Loss": loss.item()}
-                    if 'is_moving' in batch:
-                        log_dict["Train/Is_Moving"] = float(batch['is_moving'].float().mean())
-                    wandb.log(log_dict)
+                    accumulated_loss += loss.item()
+
+            # Check gradients after accumulation and compute gradient norm
+            if not nan_exists:
+                parameters = [p for p in self.model.parameters() if p.grad is not None]
+                if parameters:
+                    # Check for NaN or inf gradients BEFORE unscaling
+                    has_nan_grad = False
+                    for param in parameters:
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print('WARNING: NaN or Inf gradients detected. Skipping step...')
+                                has_nan_grad = True
+                                break
+                    
+                    if has_nan_grad:
+                        nan_exists = True
+                        torch.cuda.empty_cache()
+                        # Reset gradients and continue
+                        self.optimizer.zero_grad()
+                        continue
+                    
+                    # Now safe to unscale
+                    self.scaler.unscale_(self.optimizer)
+                    
+                    # Clip gradient values to prevent extreme values
+                    for param in parameters:
+                        if param.grad is not None:
+                            param.grad.clamp_(-10.0, 10.0)  # Clip gradient values
+                    
+                    # Apply gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2.0).to(target.device) for p in parameters]), 2.0)
+                    
+                    if torch.isnan(total_norm):
+                        print('WARNING: NaN gradients after accumulation. Skipping step...')
+                        nan_exists = True 
+                        torch.cuda.empty_cache()
+                        # Reset gradients and continue
+                        self.optimizer.zero_grad()
+                        continue
+                    else:
+                        accumulated_grad_norm = total_norm.item()
+
+            if nan_exists:
+                # If we had NaN in loss, skip the optimizer step entirely
+                continue
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            
+            # Step the learning rate scheduler
+            if isinstance(self.scheduler, CosineAnnealingLR):
+                self.scheduler.step()
+            # For ReduceLROnPlateau, we'd step with validation loss later
+            
+            # Apply warmup
+            if self.step < self.warmup_steps:
+                warmup_factor = min(1.0, self.step / self.warmup_steps)
+                target_lr = self.optimizer.param_groups[0]['lr']  # Get the target LR from scheduler
+                current_lr = self.warmup_lr + (target_lr - self.warmup_lr) * warmup_factor
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = current_lr
+
             self.ema.update()
 
-            if self.step % self.save_and_sample_every == 0:
+            # Track loss history
+            current_loss = accumulated_loss / self.gradient_accumulate_every
+            self.loss_history.append(current_loss)
+
+            # Log training metrics to wandb
+            if self.use_wandb:
+                log_dict = {
+                    "Train/Loss/Total": current_loss,
+                    "Train/Loss/Diffusion": current_loss,
+                    "Train/Gradients/Norm": accumulated_grad_norm,
+                    "Train/Learning_Rate": self.optimizer.param_groups[0]['lr'],
+                    "Train/Step": self.step,
+                    "Train/EMA_Decay": self.ema.beta,
+                }
+                
+                # Add loss history statistics
+                if len(self.loss_history) > 100:
+                    recent_losses = self.loss_history[-100:]
+                    log_dict["Train/Loss/Recent_Mean"] = np.mean(recent_losses)
+                    log_dict["Train/Loss/Recent_Std"] = np.std(recent_losses)
+                    log_dict["Train/Loss/Recent_Min"] = np.min(recent_losses)
+                
+                # Add memory usage if CUDA is available
+                if torch.cuda.is_available():
+                    log_dict["Train/GPU_Memory_Allocated_GB"] = torch.cuda.memory_allocated() / 1024**3
+                    log_dict["Train/GPU_Memory_Reserved_GB"] = torch.cuda.memory_reserved() / 1024**3
+                
+                # Add gradient norms for different parameter groups
+                param_groups = {
+                    'time_mlp': [],
+                    'linear_out': [],
+                    'motion_transformer': [],
+                    'other': []
+                }
+                
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if 'time_mlp' in name:
+                            param_groups['time_mlp'].append(grad_norm)
+                        elif 'linear_out' in name:
+                            param_groups['linear_out'].append(grad_norm)
+                        elif 'motion_transformer' in name:
+                            param_groups['motion_transformer'].append(grad_norm)
+                        else:
+                            param_groups['other'].append(grad_norm)
+                
+                # Log average gradient norms for each component
+                for group_name, norms in param_groups.items():
+                    if norms:
+                        log_dict[f"Train/Gradients/{group_name}_avg"] = sum(norms) / len(norms)
+                        log_dict[f"Train/Gradients/{group_name}_max"] = max(norms)
+                        log_dict[f"Train/Gradients/{group_name}_min"] = min(norms)
+                
+                # Add scaler scale for AMP monitoring
+                if self.amp:
+                    log_dict["Train/Scaler_Scale"] = self.scaler.get_scale()
+                
+                wandb.log(log_dict, step=self.step)
+
+            # Print progress occasionally 
+            if self.step % 100 == 0:
+                print(f"Step {self.step}: Loss={current_loss:.6f}, Grad_Norm={accumulated_grad_norm:.4f}, LR={self.optimizer.param_groups[0]['lr']:.2e}")
+                
+                # Check for NaN in model parameters
+                if self.check_model_nan():
+                    print("WARNING: NaN detected in model parameters. Stopping training.")
+                    break
+
+            if self.step != 0 and self.step % 10 == 0:
                 self.ema.ema_model.eval()
+
                 with torch.no_grad():
-                    try:
-                        val_batch = next(self.val_iter)
-                    except StopIteration:
-                        self.val_iter = iter(self.val_loader)
-                        val_batch = next(self.val_iter)
+                    val_data_dict = next(self.val_dl)
+                    val_condition = val_data_dict['condition'].cuda()
+                    val_target = val_data_dict['target'].cuda()
 
-                    left_hand = val_batch['left_hand'].cuda()
-                    right_hand = val_batch['right_hand'].cuda()
-                    object_motion = val_batch['object_motion'].cuda()
-                    seq_len = val_batch['seq_len'].cuda()
-                    frame_weights = val_batch['frame_weights'].cuda()
+                    bs, num_steps, _ = val_target.shape
 
-                    hand_poses = torch.cat([left_hand, right_hand], dim=-1)
-
+                    # Generate padding mask for validation
+                    seq_len = torch.full((bs,), num_steps, dtype=torch.long, device=val_target.device)
                     actual_seq_len = seq_len + 1
-                    tmp_mask = torch.arange(self.window+1, device=hand_poses.device).expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
+                    tmp_mask = torch.arange(self.window+1, device=val_target.device).expand(bs, self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
                     padding_mask = tmp_mask[:, None, :]
 
-                    val_loss = self.model(object_motion, hand_poses, padding_mask=padding_mask, frame_weight=frame_weights)
+                    # Get validation loss 
+                    val_loss_diffusion = self.model(val_target, val_condition, padding_mask=padding_mask)
+                    val_loss = val_loss_diffusion 
+                    
+                    # Track validation loss history
+                    self.val_loss_history.append(val_loss.item())
+                    
                     if self.use_wandb:
-                        wandb.log({"Validation/Loss": val_loss.item()})
-                
-                milestone = self.step // self.save_and_sample_every
-                self.save(milestone)
+                        val_log_dict = {
+                            "Validation/Loss/Total": val_loss.item(),
+                            "Validation/Loss/Diffusion": val_loss_diffusion.item(),
+                        }
+                        
+                        # Add validation loss statistics
+                        if len(self.val_loss_history) > 50:
+                            recent_val_losses = self.val_loss_history[-50:]
+                            val_log_dict["Validation/Loss/Recent_Mean"] = np.mean(recent_val_losses)
+                            val_log_dict["Validation/Loss/Recent_Std"] = np.std(recent_val_losses)
+                        
+                        wandb.log(val_log_dict, step=self.step)
+                    
+                    # Step ReduceLROnPlateau scheduler if using it
+                    if isinstance(self.scheduler, ReduceLROnPlateau):
+                        self.scheduler.step(val_loss.item())
+
+                    milestone = self.step // self.save_and_sample_every
+            
+                    bs_for_vis = 1
+
+                    if self.step % self.save_and_sample_every == 0:
+                        self.save(milestone)
+
+                        # Sample from the model
+                        sampled_trajectories = self.ema.ema_model.sample(
+                            val_target[:bs_for_vis], 
+                            val_condition[:bs_for_vis], 
+                            padding_mask=padding_mask[:bs_for_vis]
+                        )
+
+                        self.gen_vis_res(sampled_trajectories, val_data_dict, self.step, vis_tag="pred_object")
 
             self.step += 1
-        
-        print('Training complete')
+
+        print('training complete')
+
         if self.use_wandb:
             wandb.run.finish()
 
@@ -522,411 +444,421 @@ class Trainer(object):
         self.load(milestone)
         self.ema.ema_model.eval()
 
-        mpjpe_list = []
+        num_sample = 50
         
-        # Use validation dataset for testing
-        val_dataset = self.val_dataset
-        num_test_samples = min(500, len(val_dataset))  # Test on larger subset
-
-        # For enhanced visualization - collect trajectory segments
-        trajectory_segments = []
-
         with torch.no_grad():
-            moving_samples_processed = 0
-            stationary_samples_skipped = 0
-            max_moving_samples = 50  # Limit to 50 moving examples for visualization
-            
-            for s_idx in range(num_test_samples):
-                data_dict = val_dataset.sample_window(mode='random')
-                
-                # Skip stationary examples - only visualize moving ones
-                if not data_dict['is_moving']:
-                    stationary_samples_skipped += 1
-                    continue
-                
-                # Stop after processing enough moving examples
-                if moving_samples_processed >= max_moving_samples:
-                    break
-                
-                left_hand = data_dict['left_hand'].cuda().unsqueeze(0)
-                right_hand = data_dict['right_hand'].cuda().unsqueeze(0)
-                object_motion_gt = data_dict['object_motion'].cuda().unsqueeze(0)
-                seq_len = data_dict['seq_len'].cuda().unsqueeze(0)
-                origin = data_dict['origin'].cuda().unsqueeze(0)
+            for s_idx in range(num_sample):
+                if self.test_on_train:
+                    val_data_dict = next(self.dl)
+                else:
+                    val_data_dict = next(self.val_dl)
+                    
+                condition = val_data_dict['condition'].cuda()
+                target = val_data_dict['target'].cuda()
 
-                hand_poses = torch.cat([left_hand, right_hand], dim=-1)
-                
+                bs, num_steps, _ = target.shape
+
+                # Generate padding mask 
+                seq_len = torch.full((bs,), num_steps, dtype=torch.long, device=target.device)
                 actual_seq_len = seq_len + 1
-                tmp_mask = torch.arange(self.window+1, device='cuda').expand(hand_poses.shape[0], self.window+1) < actual_seq_len[:, None]
+                tmp_mask = torch.arange(self.window+1, device=target.device).expand(bs, self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
                 padding_mask = tmp_mask[:, None, :]
 
-                all_res_list = self.ema.ema_model.sample(object_motion_gt, hand_poses, padding_mask=padding_mask)
+                max_num = 1
 
-                # Denormalize the output
-                all_res_list = val_dataset.denormalize(all_res_list, val_dataset.object_motion_mean.to(all_res_list.device), val_dataset.object_motion_std.to(all_res_list.device))
-                object_motion_gt = val_dataset.denormalize(object_motion_gt, val_dataset.object_motion_mean.to(object_motion_gt.device), val_dataset.object_motion_std.to(object_motion_gt.device))
+                sampled_trajectories = self.ema.ema_model.sample(
+                    target[:max_num], 
+                    condition[:max_num], 
+                    padding_mask=padding_mask[:max_num]
+                )
 
-                # Store trajectory segment info before restoring absolute coordinates
-                segment_info = {
-                    'demo_id': data_dict['demo_id'],
-                    'obj_id': data_dict['obj_id'],
-                    'is_moving': data_dict['is_moving'],
-                    'origin': origin.cpu().numpy(),
-                    'seq_len': seq_len.cpu().numpy(),
-                    's_idx': s_idx
-                }
+                vis_tag = str(milestone)+"_sample_"+str(s_idx)
 
-                for i in range(all_res_list.shape[0]):
-                    pred_motion = all_res_list[i, :seq_len[i]]
-                    gt_motion = object_motion_gt[i, :seq_len[i]]
-                    
-                    # Denormalize hand poses for visualization
-                    left_hand_denorm = val_dataset.denormalize(left_hand[i, :seq_len[i]], 
-                                                             val_dataset.left_hand_mean.to(left_hand.device), 
-                                                             val_dataset.left_hand_std.to(left_hand.device))
-                    right_hand_denorm = val_dataset.denormalize(right_hand[i, :seq_len[i]], 
-                                                              val_dataset.right_hand_mean.to(right_hand.device), 
-                                                              val_dataset.right_hand_std.to(right_hand.device))
-                    
-                    # Restore hand poses to original coordinate system
-                    hand_poses_restored = torch.cat([left_hand_denorm, right_hand_denorm], dim=-1)
-                    
-                    # Using position from 9d representation
-                    pred_pos = pred_motion[:, :3]
-                    gt_pos = gt_motion[:, :3]
-                    
-                    mpjpe = torch.norm(pred_pos - gt_pos, dim=-1).mean().item()
-                    mpjpe_list.append(mpjpe)
-
-                    # Create a directory for each sample
-                    vis_tag = f"{milestone}_sidx_{s_idx}_ex_{i}"
-                    dest_folder = os.path.join(self.vis_folder, vis_tag)
-                    os.makedirs(dest_folder, exist_ok=True)
-
-                    # Save the results for visualization (original system)
-                    np.save(os.path.join(dest_folder, "sampled_motion.npy"), pred_motion.cpu().numpy())
-                    np.save(os.path.join(dest_folder, "ground_truth_object.npy"), gt_motion.cpu().numpy())
-                    np.save(os.path.join(dest_folder, "input_hand_poses.npy"), hand_poses_restored.cpu().numpy())
-                    
-                    # Save enhanced context for better visualization
-                    centered_gt_motion = gt_motion.clone()
-                    centered_pred_motion = pred_motion.clone()
-                    
-                    context_info = {
-                        'demo_id': data_dict['demo_id'],
-                        'obj_id': data_dict['obj_id'],
-                        'is_moving': bool(data_dict['is_moving']),
-                        'origin': origin[i].cpu().numpy(),
-                        'actual_length': int(seq_len[i]),
-                        'window_idx': s_idx,
-                        'batch_idx': i,
-                        'milestone': milestone,
-                        # Save centered versions for comparison
-                        'centered_gt_motion': centered_gt_motion.cpu().numpy(),
-                        'centered_pred_motion': centered_pred_motion.cpu().numpy(),
-                        'motion_type': 'moving' if data_dict['is_moving'] else 'stationary'
-                    }
-                    
-                    # Save context as JSON for easier inspection
-                    import json
-                    with open(os.path.join(dest_folder, "context_info.json"), 'w') as f:
-                        json.dump(context_info, f, indent=2, default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x))
-                    
-                    # Also save as pickle for programmatic access
-                    with open(os.path.join(dest_folder, "context_info.pkl"), 'wb') as f:
-                        pickle.dump(context_info, f)
-
-                    # Create enhanced visualization
-                    self.create_enhanced_visualization(dest_folder, context_info)
-                    
-                    # Generate the standard visualization video as well
-                    create_training_video(dest_folder)
-
-                # Store for potential trajectory reconstruction
-                trajectory_segments.append({
-                    'segment_info': segment_info,
-                    'data_dict': data_dict
-                })
+                if self.test_on_train:
+                    vis_tag = vis_tag + "_on_train"
                 
-                moving_samples_processed += 1
+                self.gen_vis_res(sampled_trajectories, val_data_dict, milestone, vis_tag=vis_tag)
 
-        mean_mpjpe = np.mean(mpjpe_list) if mpjpe_list else 0.0
-        print(f"Processed {moving_samples_processed} moving examples")
-        print(f"Skipped {stationary_samples_skipped} stationary examples")
-        print(f"Total samples examined: {moving_samples_processed + stationary_samples_skipped}")
-        print(f"Mean MPJPE: {mean_mpjpe}")
+    def gen_vis_res(self, sampled_trajectories, data_dict, step, vis_gt=False, vis_tag=None):
+        """
+        Generate visualization results for sampled object trajectories.
         
-        # Save trajectory segments for potential reconstruction
-        segments_save_path = os.path.join(self.vis_folder, f"trajectory_segments_{milestone}.pkl")
-        with open(segments_save_path, 'wb') as f:
-            pickle.dump(trajectory_segments, f)
-        print(f"Saved trajectory segments to: {segments_save_path}")
+        Args:
+            sampled_trajectories: [BS, T, D] - sampled object trajectories 
+            data_dict: dictionary containing ground truth data
+            step: current training step
+            vis_gt: whether to visualize ground truth
+            vis_tag: tag for saving files
+        """
+        
+        # Get ground truth and other info
+        demo_ids = data_dict['demo_id']
+        object_ids = data_dict['object_id']
+        target_raw = data_dict['target_raw']  # Unnormalized ground truth
+        condition = data_dict['condition']    # Hand trajectories
+        
+        num_seq = sampled_trajectories.shape[0]
+        
+        # Denormalize the sampled trajectories
+        sampled_trajectories_denorm = torch.zeros_like(sampled_trajectories)
+        for i in range(num_seq):
+            sampled_trajectories_denorm[i] = torch.tensor(
+                self.ds.denormalize_data(sampled_trajectories[i].cpu().numpy(), 'object'),
+                dtype=torch.float32,
+                device=sampled_trajectories.device
+            )
+        
+        # Compute trajectory errors for logging
+        position_errors = []
+        rotation_errors = []
+        
+        for i in range(num_seq):
+            # Position error (L2 distance per frame)
+            pred_pos = sampled_trajectories_denorm[i, :, :3]  # [T, 3]
+            gt_pos = target_raw[i, :, :3].to(pred_pos.device)  # [T, 3] - ensure same device
+            pos_error = torch.norm(pred_pos - gt_pos, dim=1).mean().item()
+            position_errors.append(pos_error)
+            
+            # Rotation error if available
+            if self.ds.pose_dim >= 9:
+                if self.ds.use_velocity:
+                    # 12D format: pos(3) + vel(3) + rot(6)
+                    pred_rot = sampled_trajectories_denorm[i, :, 6:12]
+                    gt_rot = target_raw[i, :, 6:12].to(pred_rot.device)
+                else:
+                    # 9D format: pos(3) + rot(6)
+                    pred_rot = sampled_trajectories_denorm[i, :, 3:9]
+                    gt_rot = target_raw[i, :, 3:9].to(pred_rot.device)
+                
+                # Convert 6D rotation to matrices and compute angular error
+                pred_rot_mat = transforms.rotation_6d_to_matrix(pred_rot.reshape(-1, 6))
+                gt_rot_mat = transforms.rotation_6d_to_matrix(gt_rot.reshape(-1, 6))
+                
+                # Compute relative rotation and extract angle
+                relative_rot = torch.matmul(pred_rot_mat, gt_rot_mat.transpose(-1, -2))
+                trace = relative_rot.diagonal(offset=0, dim1=-1, dim2=-2).sum(-1)
+                cos_angle = (trace - 1) / 2
+                cos_angle = torch.clamp(cos_angle, -1, 1)
+                angle_error = torch.acos(cos_angle).mean().item()
+                rotation_errors.append(angle_error)
+        
+        # Log trajectory errors to wandb
+        if self.use_wandb and position_errors:
+            error_log_dict = {
+                f"Sampling/Position_Error_Mean": np.mean(position_errors),
+                f"Sampling/Position_Error_Std": np.std(position_errors),
+            }
+            if rotation_errors:
+                error_log_dict[f"Sampling/Rotation_Error_Mean_Rad"] = np.mean(rotation_errors)
+                error_log_dict[f"Sampling/Rotation_Error_Mean_Deg"] = np.degrees(np.mean(rotation_errors))
+                error_log_dict[f"Sampling/Rotation_Error_Std_Rad"] = np.std(rotation_errors)
+            
+            wandb.log(error_log_dict, step=step)
+        
+        # Save numerical results
+        if vis_tag is None:
+            vis_tag = f"step_{step}"
+            
+        save_dir = os.path.join(self.vis_folder, vis_tag)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        for seq_idx in range(num_seq):
+            demo_id = demo_ids[seq_idx] if isinstance(demo_ids, (list, tuple)) else demo_ids
+            object_id = object_ids[seq_idx] if isinstance(object_ids, (list, tuple)) else object_ids
+            
+            # Save sampled trajectory
+            sampled_path = os.path.join(save_dir, f"sampled_{demo_id}_{object_id}_{seq_idx}.npy")
+            np.save(sampled_path, sampled_trajectories_denorm[seq_idx].cpu().numpy())
+            
+            # Save ground truth trajectory  
+            gt_path = os.path.join(save_dir, f"gt_{demo_id}_{object_id}_{seq_idx}.npy")
+            np.save(gt_path, target_raw[seq_idx].cpu().numpy())
+            
+            # Save input hand trajectories
+            condition_denorm = torch.zeros_like(condition[seq_idx])
+            # Denormalize left and right hand separately
+            left_hand = condition[seq_idx, :, :self.ds.pose_dim].cpu().numpy()
+            right_hand = condition[seq_idx, :, self.ds.pose_dim:].cpu().numpy()
+            
+            left_hand_denorm = self.ds.denormalize_data(left_hand, 'left_hand')
+            right_hand_denorm = self.ds.denormalize_data(right_hand, 'right_hand')
+            
+            hands_path = os.path.join(save_dir, f"hands_{demo_id}_{object_id}_{seq_idx}.npz")
+            np.savez(hands_path, 
+                    left_hand=left_hand_denorm,
+                    right_hand=right_hand_denorm)
+            
+            print(f"Saved visualization results for {demo_id}_{object_id} to {save_dir}")
 
-    def create_enhanced_visualization(self, dest_folder, context_info):
-        """Create enhanced visualization showing motion in original coordinate system"""
+        # Generate mesh visualizations if not in quantitative evaluation mode
+        if not self.for_quant_eval:
+            self.generate_mesh_visualizations(save_dir, vis_tag)
+
+    def generate_mesh_visualizations(self, save_dir: str, vis_tag: str):
+        """
+        Generate mesh visualizations using the TrajectoryMeshVisualizer.
+        
+        Args:
+            save_dir: Directory containing saved trajectory data
+            vis_tag: Tag for this visualization
+        """
         try:
-            import matplotlib.pyplot as plt
+            # Initialize the mesh visualizer
+            visualizer = TrajectoryMeshVisualizer(
+                data_root_folder=self.data_root_folder,
+                object_geometry_path=getattr(self.ds, 'obj_geo_root_folder', None)
+            )
             
-            # Load the motion data
-            sampled_motion = np.load(os.path.join(dest_folder, "sampled_motion.npy"))
-            gt_motion = np.load(os.path.join(dest_folder, "ground_truth_object.npy"))
-            hand_poses = np.load(os.path.join(dest_folder, "input_hand_poses.npy"))
+            print(f"Generating mesh visualizations for {vis_tag}...")
             
-            # Split hand poses
-            left_hand = hand_poses[:, :9]
-            right_hand = hand_poses[:, 9:]
+            # Generate mesh visualization from saved results
+            video_path = visualizer.visualize_from_trainer_results(
+                results_dir=save_dir,
+                sequence_name=vis_tag,
+                render_video=True
+            )
             
-            # Extract positions (first 3 dimensions)
-            sampled_pos = sampled_motion[:, :3]
-            gt_pos = gt_motion[:, :3]
-            left_hand_pos = left_hand[:, :3]  
-            right_hand_pos = right_hand[:, :3]
+            print(f"Mesh visualization complete. Video saved to: {video_path}")
             
-            # Create comprehensive visualization
-            fig = plt.figure(figsize=(16, 12))
-            
-            # Top-down view (X-Y plane) - Most important for seeing motion
-            ax1 = fig.add_subplot(2, 3, 1)
-            ax1.plot(gt_pos[:, 0], gt_pos[:, 1], 'g-', linewidth=3, label='Ground Truth', alpha=0.8)
-            ax1.plot(sampled_pos[:, 0], sampled_pos[:, 1], 'r--', linewidth=2, label='Predicted', alpha=0.8)
-            ax1.plot(left_hand_pos[:, 0], left_hand_pos[:, 1], 'b-', linewidth=1, label='Left Hand', alpha=0.6)
-            ax1.plot(right_hand_pos[:, 0], right_hand_pos[:, 1], 'm-', linewidth=1, label='Right Hand', alpha=0.6)
-            ax1.scatter(gt_pos[0, 0], gt_pos[0, 1], c='green', s=80, marker='o', label='GT Start', zorder=5)
-            ax1.scatter(gt_pos[-1, 0], gt_pos[-1, 1], c='darkgreen', s=80, marker='s', label='GT End', zorder=5)
-            ax1.set_xlabel('X (m)')
-            ax1.set_ylabel('Y (m)')
-            ax1.set_title(f'Top View - Original Coordinate System\n{context_info["motion_type"].title()} Motion')
-            ax1.grid(True, alpha=0.3)
-            ax1.axis('equal')
-            ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            
-            # Side view (X-Z plane) 
-            ax2 = fig.add_subplot(2, 3, 2)
-            ax2.plot(gt_pos[:, 0], gt_pos[:, 2], 'g-', linewidth=3, label='Ground Truth', alpha=0.8)
-            ax2.plot(sampled_pos[:, 0], sampled_pos[:, 2], 'r--', linewidth=2, label='Predicted', alpha=0.8)
-            ax2.plot(left_hand_pos[:, 0], left_hand_pos[:, 2], 'b-', linewidth=1, label='Left Hand', alpha=0.6)
-            ax2.plot(right_hand_pos[:, 0], right_hand_pos[:, 2], 'm-', linewidth=1, label='Right Hand', alpha=0.6)
-            ax2.scatter(gt_pos[0, 0], gt_pos[0, 2], c='green', s=80, marker='o', zorder=5)
-            ax2.scatter(gt_pos[-1, 0], gt_pos[-1, 2], c='darkgreen', s=80, marker='s', zorder=5)
-            ax2.set_xlabel('X (m)')
-            ax2.set_ylabel('Z (m)')
-            ax2.set_title('Side View (X-Z)')
-            ax2.grid(True, alpha=0.3)
-            
-            # Y-Z view (front view)
-            ax3 = fig.add_subplot(2, 3, 3)
-            ax3.plot(gt_pos[:, 1], gt_pos[:, 2], 'g-', linewidth=3, label='Ground Truth', alpha=0.8)
-            ax3.plot(sampled_pos[:, 1], sampled_pos[:, 2], 'r--', linewidth=2, label='Predicted', alpha=0.8)
-            ax3.plot(left_hand_pos[:, 1], left_hand_pos[:, 2], 'b-', linewidth=1, label='Left Hand', alpha=0.6)
-            ax3.plot(right_hand_pos[:, 1], right_hand_pos[:, 2], 'm-', linewidth=1, label='Right Hand', alpha=0.6)
-            ax3.scatter(gt_pos[0, 1], gt_pos[0, 2], c='green', s=80, marker='o', zorder=5)
-            ax3.scatter(gt_pos[-1, 1], gt_pos[-1, 2], c='darkgreen', s=80, marker='s', zorder=5)
-            ax3.set_xlabel('Y (m)')
-            ax3.set_ylabel('Z (m)')
-            ax3.set_title('Front View (Y-Z)')
-            ax3.grid(True, alpha=0.3)
-            
-            # Position error over time
-            ax4 = fig.add_subplot(2, 3, 4)
-            position_errors = np.linalg.norm(gt_pos - sampled_pos, axis=1)
-            ax4.plot(position_errors, 'purple', linewidth=2)
-            ax4.set_xlabel('Frame')
-            ax4.set_ylabel('Position Error (m)')
-            ax4.set_title(f'Position Error Over Time\nMean: {np.mean(position_errors):.4f}m')
-            ax4.grid(True, alpha=0.3)
-            
-            # Distance from window origin over time
-            ax5 = fig.add_subplot(2, 3, 5)
-            origin = context_info['origin']
-            gt_dist_from_origin = np.linalg.norm(gt_pos - origin, axis=1) 
-            pred_dist_from_origin = np.linalg.norm(sampled_pos - origin, axis=1)
-            ax5.plot(gt_dist_from_origin, 'g-', linewidth=2, label='GT Distance')
-            ax5.plot(pred_dist_from_origin, 'r--', linewidth=2, label='Pred Distance')
-            ax5.set_xlabel('Frame')
-            ax5.set_ylabel('Distance from Window Origin (m)')
-            ax5.set_title('Distance from Window Start Position')
-            ax5.legend()
-            ax5.grid(True, alpha=0.3)
-            
-            # Velocity comparison
-            ax6 = fig.add_subplot(2, 3, 6)
-            if len(gt_pos) > 1:
-                gt_velocity = np.linalg.norm(np.diff(gt_pos, axis=0), axis=1)
-                pred_velocity = np.linalg.norm(np.diff(sampled_pos, axis=0), axis=1)
-                frames = range(1, len(gt_pos))
-                ax6.plot(frames, gt_velocity, 'g-', linewidth=2, label='GT Velocity')
-                ax6.plot(frames, pred_velocity, 'r--', linewidth=2, label='Pred Velocity')
-                ax6.set_xlabel('Frame')
-                ax6.set_ylabel('Velocity (m/frame)')
-                ax6.set_title('Velocity Over Time')
-                ax6.legend()
-                ax6.grid(True, alpha=0.3)
-            
-            plt.suptitle(f'Enhanced Motion Visualization - {context_info["demo_id"]} - {context_info["obj_id"]}\n'
-                        f'Motion Type: {context_info["motion_type"].title()} | Length: {context_info["actual_length"]} frames', 
-                        fontsize=14)
-            
-            plt.tight_layout()
-            
-            # Save the enhanced visualization
-            enhanced_vis_path = os.path.join(dest_folder, "enhanced_visualization.png")
-            plt.savefig(enhanced_vis_path, dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            print(f"Enhanced visualization saved: {enhanced_vis_path}")
-            
+            # Log video path to wandb if available
+            if self.use_wandb:
+                wandb.log({f"Visualization/Video_Path": video_path}, step=int(vis_tag.split('_')[-1]) if 'step_' in vis_tag else 0)
+                
         except Exception as e:
-            print(f"Error creating enhanced visualization: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Warning: Mesh visualization failed: {e}")
+            print("Continuing without mesh visualization...")
+
+    def evaluate_model(self, num_eval_samples=100):
+        """
+        Evaluate the model by computing position and rotation errors.
+        """
+        self.ema.ema_model.eval()
+        
+        position_errors = []
+        rotation_errors = []
+        
+        with torch.no_grad():
+            for eval_idx in range(num_eval_samples):
+                if self.test_on_train:
+                    data_dict = next(self.dl)
+                else:
+                    data_dict = next(self.val_dl)
+                    
+                condition = data_dict['condition'].cuda()
+                target = data_dict['target'].cuda()
+                target_raw = data_dict['target_raw'].cuda()
+                
+                bs, num_steps, _ = target.shape
+                
+                # Generate padding mask
+                seq_len = torch.full((bs,), num_steps, dtype=torch.long, device=target.device)
+                actual_seq_len = seq_len + 1
+                tmp_mask = torch.arange(self.window+1, device=target.device).expand(bs, self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                padding_mask = tmp_mask[:, None, :]
+                
+                # Sample from model
+                sampled_trajectories = self.ema.ema_model.sample(
+                    target, condition, padding_mask=padding_mask
+                )
+                
+                # Denormalize for evaluation
+                for i in range(bs):
+                    sampled_denorm = torch.tensor(
+                        self.ds.denormalize_data(sampled_trajectories[i].cpu().numpy(), 'object'),
+                        dtype=torch.float32, device=target.device
+                    )
+                    
+                    # Extract positions (first 3 dimensions)
+                    gt_pos = target_raw[i, :, :3]
+                    pred_pos = sampled_denorm[:, :3].to(gt_pos.device)
+                    
+                    # Position error (L2 distance per frame)
+                    pos_error = torch.norm(pred_pos - gt_pos, dim=1).mean().item()
+                    position_errors.append(pos_error)
+                    
+                    # Rotation error (if using rotation data)
+                    if self.ds.pose_dim >= 9:  # Has rotation data
+                        if self.use_velocity:
+                            # 12D format: pos(3) + vel(3) + rot(6)
+                            gt_rot = target_raw[i, :, 6:12]
+                            pred_rot = sampled_denorm[:, 6:12].to(gt_rot.device)
+                        else:
+                            # 9D format: pos(3) + rot(6)
+                            gt_rot = target_raw[i, :, 3:9]
+                            pred_rot = sampled_denorm[:, 3:9].to(gt_rot.device)
+                        
+                        # Convert 6D rotation to matrices and compute angular error
+                        gt_rot_mat = transforms.rotation_6d_to_matrix(gt_rot.reshape(-1, 6))
+                        pred_rot_mat = transforms.rotation_6d_to_matrix(pred_rot.reshape(-1, 6))
+                        
+                        # Compute relative rotation and extract angle
+                        relative_rot = torch.matmul(pred_rot_mat, gt_rot_mat.transpose(-1, -2))
+                        trace = relative_rot.diagonal(offset=0, dim1=-1, dim2=-2).sum(-1)
+                        cos_angle = (trace - 1) / 2
+                        cos_angle = torch.clamp(cos_angle, -1, 1)
+                        angle_error = torch.acos(cos_angle).mean().item()
+                        rotation_errors.append(angle_error)
+        
+        mean_pos_error = np.mean(position_errors)
+        mean_rot_error = np.mean(rotation_errors) if rotation_errors else 0.0
+        
+        print(f"Evaluation Results:")
+        print(f"  Mean Position Error: {mean_pos_error:.4f}m")
+        print(f"  Mean Rotation Error: {mean_rot_error:.4f} rad ({np.degrees(mean_rot_error):.2f}°)")
+        
+        return mean_pos_error, mean_rot_error
 
 def run_train(opt, device):
+    # Prepare Directories
     save_dir = Path(opt.save_dir)
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)
 
+    # Save run settings
     with open(save_dir / 'opt.yaml', 'w') as f:
         yaml.safe_dump(vars(opt), f, sort_keys=True)
 
-    # Create separate train and validation datasets
-    train_dataset = HandToObjectDataset(
-        opt.data_path, 
-        window=opt.window, 
-        train=True,
-        velocity_threshold=opt.velocity_threshold,
-        balance_ratio=opt.balance_ratio,
-        max_oversample_ratio=opt.max_oversample_ratio
-    )
+    # Define model dimensions based on data format
+    pose_dim = 12 if opt.use_velocity else 9
+    repr_dim = pose_dim  # Output dimension (object trajectory)
+    input_dim = pose_dim * 2  # Input dimension (left + right hand)
     
-    val_dataset = HandToObjectDataset(
-        opt.data_path, 
-        window=opt.window, 
-        train=False,
-        velocity_threshold=opt.velocity_threshold,
-        balance_ratio=opt.balance_ratio,
-        max_oversample_ratio=opt.max_oversample_ratio
-    )
-    
-    repr_dim = train_dataset.pose_dim
-    input_dim = train_dataset.pose_dim * 2
-
+    # Use L2 loss for better stability with pred_x0 objective
+    loss_type = "l2"  # Changed from "l1" to "l2"
+  
     diffusion_model = CondGaussianDiffusion(
-        opt,
-        d_feats=repr_dim,
+        opt, 
+        d_feats=repr_dim, 
         d_model=opt.d_model,
-        n_dec_layers=opt.n_dec_layers,
-        n_head=opt.n_head,
-        d_k=opt.d_k,
+        n_dec_layers=opt.n_dec_layers, 
+        n_head=opt.n_head, 
+        d_k=opt.d_k, 
         d_v=opt.d_v,
-        max_timesteps=opt.window+1,
-        out_dim=repr_dim,
-        d_input_feats=input_dim,
+        max_timesteps=opt.window+1, 
+        out_dim=repr_dim, 
         timesteps=1000,
-        objective="pred_x0",
-        loss_type="l1",
-        batch_size=opt.batch_size
-    ).to(device)
+        objective="pred_x0", 
+        loss_type=loss_type,
+        batch_size=opt.batch_size,
+        # Add P2 loss weight for better timestep weighting
+        p2_loss_weight_gamma=1.0,  # Recommended value from DDPM paper
+        p2_loss_weight_k=1,
+    )
+   
+    diffusion_model.to(device)
 
     trainer = Trainer(
         opt,
         diffusion_model,
-        train_dataset,
-        val_dataset,
         train_batch_size=opt.batch_size,
         train_lr=opt.learning_rate,
-        train_num_steps=opt.num_steps,
+        train_num_steps=opt.train_steps,  # Use configurable training steps
         gradient_accumulate_every=2,
+        ema_decay=0.995,
         amp=True,
         results_folder=str(wdir),
-        use_wandb=opt.use_wandb,
-        use_weighted_loss=opt.use_weighted_loss,
-        moving_weight=opt.moving_weight
     )
 
     trainer.train()
 
+    torch.cuda.empty_cache()
+
 def run_sample(opt, device):
+    # Prepare Directories
     save_dir = Path(opt.save_dir)
     wdir = save_dir / 'weights'
 
-    # For sampling, we only need validation dataset
-    val_dataset = HandToObjectDataset(
-        opt.data_path, 
-        window=opt.window, 
-        train=False,
-        velocity_threshold=opt.velocity_threshold,
-        balance_ratio=opt.balance_ratio,
-        max_oversample_ratio=opt.max_oversample_ratio
-    )
-    repr_dim = val_dataset.pose_dim
-    input_dim = val_dataset.pose_dim * 2
-
+    # Define model dimensions
+    pose_dim = 12 if opt.use_velocity else 9
+    repr_dim = pose_dim
+    
+    loss_type = "l1"
+    
     diffusion_model = CondGaussianDiffusion(
-        opt,
-        d_feats=repr_dim,
+        opt, 
+        d_feats=repr_dim, 
         d_model=opt.d_model,
-        n_dec_layers=opt.n_dec_layers,
-        n_head=opt.n_head,
-        d_k=opt.d_k,
+        n_dec_layers=opt.n_dec_layers, 
+        n_head=opt.n_head, 
+        d_k=opt.d_k, 
         d_v=opt.d_v,
-        max_timesteps=opt.window+1,
-        out_dim=repr_dim,
-        d_input_feats=input_dim,
+        max_timesteps=opt.window+1, 
+        out_dim=repr_dim, 
         timesteps=1000,
-        objective="pred_x0",
-        loss_type="l1",
+        objective="pred_x0", 
+        loss_type=loss_type,
         batch_size=opt.batch_size
-    ).to(device)
+    )
+
+    diffusion_model.to(device)
 
     trainer = Trainer(
         opt,
         diffusion_model,
-        val_dataset,  # Use val_dataset for both
-        val_dataset,
         train_batch_size=opt.batch_size,
+        train_lr=opt.learning_rate,
+        train_num_steps=100000,
+        gradient_accumulate_every=2,
+        ema_decay=0.995,
+        amp=True,
         results_folder=str(wdir),
-        use_wandb=False,
-        use_weighted_loss=opt.use_weighted_loss,
-        moving_weight=opt.moving_weight
+        use_wandb=False 
     )
     
     trainer.cond_sample_res()
 
+    torch.cuda.empty_cache()
+
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='data/processed_data.pkl')
-    parser.add_argument('--window', type=int, default=128)
-    parser.add_argument('--d_model', type=int, default=512)
-    parser.add_argument('--n_dec_layers', type=int, default=6)
-    parser.add_argument('--n_head', type=int, default=8)
-    parser.add_argument('--d_k', type=int, default=64)
-    parser.add_argument('--d_v', type=int, default=64)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--num_steps', type=int, default=100000)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--save_dir', type=str, default='runs/train_hand_to_object')
-    parser.add_argument('--wandb_pj_name', type=str, default='hand_object_diffusion')
-    parser.add_argument('--entity', type=str, default='egorecon')
-    parser.add_argument('--exp_name', type=str, default='initial_training')
-    parser.add_argument('--use_wandb', action='store_true', default=True)
-    parser.add_argument('--test_sample_res', action='store_true')
     
-    # Dataset balancing parameters
-    parser.add_argument('--velocity_threshold', type=float, default=0.02, help='Velocity threshold for motion detection')
-    parser.add_argument('--balance_ratio', type=float, default=0.5, help='Ratio of moving windows (0.5 = equal balance)')
+    # Project and logging
+    parser.add_argument('--project', default='runs/train', help='output folder for weights and visualizations')
+    parser.add_argument('--wandb_pj_name', type=str, default='hand_object_diffusion', help='wandb project name')
+    parser.add_argument('--entity', default='egorecon', help='W&B entity')
+    parser.add_argument('--exp_name', default='hand_to_object_exp', help='save to project/exp_name')
+    parser.add_argument('--device', default='0', help='cuda device')
+
+    # Data parameters
+    parser.add_argument('--data_root_folder', default='data/processed_data.pkl', help='path to processed data pickle file')
+    parser.add_argument('--window', type=int, default=120, help='window size for trajectories')
+    parser.add_argument('--use_velocity', action='store_true', help='use 12D format with velocity (default: 9D)')
+    parser.add_argument('--sampling_strategy', default='motion_only', choices=['balanced', 'motion_only', 'random'], 
+                       help='sampling strategy: balanced, motion_only, or random')
+    parser.add_argument('--motion_threshold', type=float, default=0.005, 
+                       help='threshold for motion detection (meters per frame)')
+    parser.add_argument('--min_motion_frames', type=int, default=10, 
+                       help='minimum consecutive motion frames to consider a window as moving')
+
+    # Model parameters  
+    parser.add_argument('--batch_size', type=int, default=32, help='batch size')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='learning rate')  # Reduced from 2e-4
+    parser.add_argument('--n_dec_layers', type=int, default=4, help='number of decoder layers')
+    parser.add_argument('--n_head', type=int, default=4, help='number of attention heads')
+    parser.add_argument('--d_k', type=int, default=256, help='key dimension in transformer')
+    parser.add_argument('--d_v', type=int, default=256, help='value dimension in transformer')
+    parser.add_argument('--d_model', type=int, default=512, help='model dimension in transformer')
     
-    # Weighted loss parameters (alternative to aggressive oversampling)
-    parser.add_argument('--use_weighted_loss', action='store_true', help='Use weighted loss instead of oversampling')
-    parser.add_argument('--moving_weight', type=float, default=10.0, help='Weight multiplier for moving window losses')
-    parser.add_argument('--max_oversample_ratio', type=float, default=5.0, help='Maximum oversampling ratio to prevent instability')
+    # Training control
+    parser.add_argument('--checkpoint', type=str, default="", help='checkpoint path to resume from')
+    parser.add_argument('--train_steps', type=int, default=100000, help='number of training steps')  # Increased from 100k
+    parser.add_argument('--max_grad_norm', type=float, default=2.0, help='gradient clipping norm')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay for optimizer')
     
+    # Testing parameters
+    parser.add_argument("--test_sample_res", action="store_true", help="test sampling results")
+    parser.add_argument("--test_sample_res_on_train", action="store_true", help="test sampling on training data")
+    parser.add_argument("--for_quant_eval", action="store_true", help="quantitative evaluation mode")
+
     opt = parser.parse_args()
     return opt
 
 if __name__ == "__main__":
     opt = parse_opt()
-    opt.save_dir = os.path.join(opt.save_dir, opt.exp_name)
-    device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu")
+    opt.save_dir = os.path.join(opt.project, opt.exp_name)
+    opt.exp_name = opt.save_dir.split('/')[-1]
+    device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
+    
     if opt.test_sample_res:
         run_sample(opt, device)
     else:

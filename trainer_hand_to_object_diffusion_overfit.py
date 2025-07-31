@@ -20,10 +20,11 @@ def load_pickle(path):
 class HandToObjectDataset:
     """Similar to HandFootManipDataset structure."""
     
-    def __init__(self, data_path, demo_id=None, target_object_id=None, window=64, use_velocity=True):
+    def __init__(self, data_path, demo_id=None, target_object_id=None, window=64, use_velocity=True, motion_threshold=0.005):
         self.window = window
         self.data_path = data_path
         self.use_velocity = use_velocity
+        self.motion_threshold = motion_threshold
         
         # Load the processed data
         print(f"Loading data from {data_path}...")
@@ -67,8 +68,13 @@ class HandToObjectDataset:
         self.full_length = min_length
         self.pose_dim = pose_dim
         
-        # Pre-compute all windows
+        # Analyze motion patterns first (using enhanced analysis)
+        self._analyze_motion_patterns()
+        
+        # Pre-compute all windows with motion classification
         self.window_data = []
+        self.moving_windows = []
+        self.stationary_windows = []
         self._prepare_windows()
         
         # For sequential sampling
@@ -76,11 +82,45 @@ class HandToObjectDataset:
         
         print(f"Dataset initialized: {self.full_length} frames, window size: {self.window}")
         print(f"Created {len(self.window_data)} overlapping windows")
-        print(f"Window step size: {self.window // 2} (50% overlap)")
+        print(f"Moving windows: {len(self.moving_windows)} ({len(self.moving_windows)/len(self.window_data)*100:.1f}%)")
+        print(f"Stationary windows: {len(self.stationary_windows)} ({len(self.stationary_windows)/len(self.window_data)*100:.1f}%)")
+        print(f"Motion threshold: {self.motion_threshold}")
         print(f"Data dimensions: Left hand {self.left_hand_full.shape}, Right hand {self.right_hand_full.shape}, Object {self.object_motion_full.shape}")
     
+    def _analyze_motion_patterns(self):
+        """Analyze motion patterns in the full trajectory (from enhanced trainer)."""
+        print("Analyzing motion patterns...")
+        
+        # Compute velocities for the object trajectory
+        if self.use_velocity:
+            positions = self.object_motion_full[:, 0:3]  # [T, 3]
+            velocities = self.object_motion_full[:, 3:6]  # [T, 3] 
+        else:
+            positions = self.object_motion_full[:, 0:3]  # [T, 3]
+            velocities = positions[1:] - positions[:-1]  # [T-1, 3]
+            velocities = torch.cat([velocities, torch.zeros(1, 3)], dim=0)  # [T, 3]
+        
+        position_distances = torch.norm(velocities, dim=1)  # [T]
+        mean_velocity = torch.mean(position_distances).item()
+        max_velocity = torch.max(position_distances).item()
+        
+        # Auto-adjust motion threshold if too high (from enhanced trainer)
+        velocity_percentiles = torch.quantile(position_distances, torch.tensor([0.5, 0.75, 0.9, 0.95, 0.99]))
+        if self.motion_threshold > velocity_percentiles[3].item():  # 95th percentile
+            original_threshold = self.motion_threshold
+            self.motion_threshold = max(velocity_percentiles[2].item(), mean_velocity * 3)
+            print(f"⚠️  MOTION THRESHOLD AUTO-ADJUSTED:")
+            print(f"    Original threshold {original_threshold:.4f} too high")
+            print(f"    New threshold: {self.motion_threshold:.4f}")
+        
+        print(f"Full trajectory motion analysis:")
+        print(f"  Mean velocity: {mean_velocity:.4f}")
+        print(f"  Max velocity: {max_velocity:.4f}")
+        print(f"  Velocity percentiles [50,75,90,95,99]: {velocity_percentiles}")
+        print(f"  📊 Using motion threshold: {self.motion_threshold:.4f}")
+    
     def _prepare_windows(self):
-        """Pre-compute all overlapping windows"""
+        """Pre-compute all overlapping windows with motion classification"""
         step_size = self.window // 2  # 50% overlap 
         
         for start_idx in range(0, self.full_length, step_size):
@@ -100,6 +140,19 @@ class HandToObjectDataset:
             right_hand = self.right_hand_full[start_idx:end_idx]
             object_motion = self.object_motion_full[start_idx:end_idx]
             
+            # Compute motion statistics for this window (from enhanced trainer)
+            if self.use_velocity:
+                positions = object_motion[:, 0:3]
+                velocities = object_motion[:, 3:6]
+            else:
+                positions = object_motion[:, 0:3]
+                velocities = positions[1:] - positions[:-1]
+                velocities = torch.cat([velocities, torch.zeros(1, 3)], dim=0)
+            
+            velocity_magnitudes = torch.norm(velocities, dim=1)
+            mean_velocity = torch.mean(velocity_magnitudes).item()
+            is_moving = mean_velocity > self.motion_threshold
+            
             # Pad if necessary to reach window size
             if actual_len < self.window:
                 pad_len = self.window - actual_len
@@ -107,16 +160,24 @@ class HandToObjectDataset:
                 right_hand = torch.cat([right_hand, torch.zeros(pad_len, self.pose_dim)], dim=0)
                 object_motion = torch.cat([object_motion, torch.zeros(pad_len, self.pose_dim)], dim=0)
             
-            # Store window data
+            # Store window data with motion classification
             window_dict = {
                 'left_hand': left_hand.unsqueeze(0),  # [1, T, 9/12]
                 'right_hand': right_hand.unsqueeze(0),  # [1, T, 9/12]
                 'object_motion': object_motion.unsqueeze(0),  # [1, T, 9/12]
                 'seq_len': torch.tensor([actual_len]),
                 'start_idx': start_idx,
-                'end_idx': end_idx
+                'end_idx': end_idx,
+                'is_moving': is_moving,
+                'mean_velocity': mean_velocity
             }
             self.window_data.append(window_dict)
+            
+            # Categorize windows (from enhanced trainer)
+            if is_moving:
+                self.moving_windows.append(len(self.window_data) - 1)
+            else:
+                self.stationary_windows.append(len(self.window_data) - 1)
     
     def __len__(self):
         return len(self.window_data)
@@ -339,7 +400,6 @@ def train_overfit(opt, device):
         d_v=opt.d_v,
         max_timesteps=opt.window+1,
         out_dim=repr_dim,
-        d_input_feats=input_dim,
         timesteps=1000,
         objective="pred_x0",
         loss_type="l1",

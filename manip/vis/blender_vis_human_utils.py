@@ -76,7 +76,12 @@ if __name__ == "__main__":
         if ".obj" in path_to_file:
             human_new_obj = bpy.ops.import_scene.obj(filepath=path_to_file, split_mode ="OFF")
         elif ".ply" in path_to_file:
-            human_new_obj = bpy.ops.import_mesh.ply(filepath=path_to_file)
+            # For Blender 4.2+, use the new PLY import operator
+            try:
+                human_new_obj = bpy.ops.wm.ply_import(filepath=path_to_file)
+            except AttributeError:
+                # Fallback for older Blender versions
+                human_new_obj = bpy.ops.import_mesh.ply(filepath=path_to_file)
         # obj_object = bpy.context.selected_objects[0]
         # if file_name == "00000.obj":
         #     human_obj_object = bpy.data.objects[str(file_name.replace(".ply", "").replace(".obj", ""))+".004"]
