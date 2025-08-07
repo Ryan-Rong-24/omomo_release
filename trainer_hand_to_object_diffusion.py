@@ -128,7 +128,7 @@ class Trainer(object):
         return False
 
     def prep_dataloader(self, window_size):
-        # Define dataset using the new HandToObjectDataset
+        # Define dataset using the new HandToObjectDataset with proper train/val split
         train_dataset = HandToObjectDataset(
             data_path=self.data_root_folder,
             window_size=window_size,
@@ -136,18 +136,24 @@ class Trainer(object):
             sampling_strategy=self.opt.sampling_strategy,
             motion_threshold=self.opt.motion_threshold,
             min_motion_frames=self.opt.min_motion_frames,
-            augment=True  # Enable data augmentation for training
+            augment=True,  # Enable data augmentation for training
+            split='train',  # Training split
+            val_split_ratio=0.2,  # 20% for validation
+            split_seed=42  # Reproducible split
         )
         
-        # Create validation dataset (using different sampling or subset)
+        # Create validation dataset with proper split
         val_dataset = HandToObjectDataset(
             data_path=self.data_root_folder,
             window_size=window_size,
             use_velocity=self.use_velocity,
-            sampling_strategy=self.opt.sampling_strategy,  # Use same strategy for validation
+            sampling_strategy=self.opt.sampling_strategy,
             motion_threshold=self.opt.motion_threshold,
             min_motion_frames=self.opt.min_motion_frames,
-            augment=False  # No augmentation for validation
+            augment=False,  # No augmentation for validation
+            split='val',  # Validation split
+            val_split_ratio=0.2,  # Same ratio for consistency
+            split_seed=42  # Same seed for consistency
         )
 
         self.ds = train_dataset 
@@ -257,12 +263,7 @@ class Trainer(object):
                     # Now safe to unscale
                     self.scaler.unscale_(self.optimizer)
                     
-                    # Clip gradient values to prevent extreme values
-                    for param in parameters:
-                        if param.grad is not None:
-                            param.grad.clamp_(-10.0, 10.0)  # Clip gradient values
-                    
-                    # Apply gradient clipping
+                    # Apply gradient clipping (remove redundant value clipping)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2.0).to(target.device) for p in parameters]), 2.0)
@@ -284,20 +285,23 @@ class Trainer(object):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            # Step the learning rate scheduler
-            if isinstance(self.scheduler, CosineAnnealingLR):
-                self.scheduler.step()
-            # For ReduceLROnPlateau, we'd step with validation loss later
-            
-            # Apply warmup
+            # Apply warmup or step scheduler
             if self.step < self.warmup_steps:
-                warmup_factor = min(1.0, self.step / self.warmup_steps)
-                target_lr = self.optimizer.param_groups[0]['lr']  # Get the target LR from scheduler
-                current_lr = self.warmup_lr + (target_lr - self.warmup_lr) * warmup_factor
+                # Apply warmup - interpolate from warmup_lr to base_lr
+                warmup_factor = self.step / self.warmup_steps
+                base_lr = self.optimizer.defaults['lr']  # Get original LR
+                current_lr = self.warmup_lr + (base_lr - self.warmup_lr) * warmup_factor
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = current_lr
+            else:
+                # Step the learning rate scheduler after warmup
+                if isinstance(self.scheduler, CosineAnnealingLR):
+                    self.scheduler.step()
+                # For ReduceLROnPlateau, we'd step with validation loss later
 
-            self.ema.update()
+            # Only update EMA if we didn't have NaN issues
+            if not nan_exists:
+                self.ema.update()
 
             # Track loss history
             current_loss = accumulated_loss / self.gradient_accumulate_every
@@ -741,7 +745,7 @@ def run_train(opt, device):
         loss_type=loss_type,
         batch_size=opt.batch_size,
         # Add P2 loss weight for better timestep weighting
-        p2_loss_weight_gamma=1.0,  # Recommended value from DDPM paper
+        p2_loss_weight_gamma=0.5,  # Reduced for better stability
         p2_loss_weight_k=1,
     )
    
@@ -772,7 +776,7 @@ def run_sample(opt, device):
     pose_dim = 12 if opt.use_velocity else 9
     repr_dim = pose_dim
     
-    loss_type = "l1"
+    loss_type = "l2"  # Use same loss type as training
     
     diffusion_model = CondGaussianDiffusion(
         opt, 

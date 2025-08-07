@@ -41,6 +41,9 @@ class HandToObjectDataset(Dataset):
         sampling_strategy='balanced',  # 'balanced', 'motion_only', 'random'
         min_motion_frames=10,  # Minimum consecutive motion frames to consider
         augment=False,  # Whether in training mode (for data augmentation)
+        split='train',  # 'train', 'val', or 'all'
+        val_split_ratio=0.2,  # Fraction of windows to use for validation
+        split_seed=42,  # Seed for reproducible splits
     ):
         self.data_path = data_path
         self.window_size = window_size
@@ -49,6 +52,9 @@ class HandToObjectDataset(Dataset):
         self.sampling_strategy = sampling_strategy
         self.min_motion_frames = min_motion_frames
         self.augment = augment  # Add training mode flag
+        self.split = split
+        self.val_split_ratio = val_split_ratio
+        self.split_seed = split_seed
         
         # Load processed data
         print(f"Loading data from {data_path}...")
@@ -67,7 +73,10 @@ class HandToObjectDataset(Dataset):
         
         # Create windows
         self.windows = self._create_windows()
-        print(f"Created {len(self.windows)} training windows")
+        
+        # Apply train/validation split
+        self.windows = self._apply_train_val_split()
+        print(f"Created {len(self.windows)} {self.split} windows")
         
         # Compute normalization statistics
         self._compute_normalization_stats()
@@ -204,6 +213,31 @@ class HandToObjectDataset(Dataset):
         else:  # 'random'
             return windows
     
+    def _apply_train_val_split(self):
+        """Apply train/validation split to windows."""
+        if self.split == 'all':
+            return self.windows
+            
+        # Use seed for reproducible splits
+        np.random.seed(self.split_seed)
+        
+        # Shuffle windows for random split
+        indices = np.arange(len(self.windows))
+        np.random.shuffle(indices)
+        
+        # Split indices
+        n_val = int(len(self.windows) * self.val_split_ratio)
+        if self.split == 'val':
+            selected_indices = indices[:n_val]
+        else:  # 'train'
+            selected_indices = indices[n_val:]
+        
+        # Return selected windows
+        selected_windows = [self.windows[i] for i in selected_indices]
+        
+        print(f"Split info: {len(selected_windows)}/{len(self.windows)} windows for {self.split}")
+        return selected_windows
+    
     def _compute_normalization_stats(self):
         """Compute normalization statistics for the dataset."""
         all_left_hand = []
@@ -225,21 +259,16 @@ class HandToObjectDataset(Dataset):
         all_right_data = np.vstack(all_right_hand)  # [N*T, D]
         all_object_data = np.vstack(all_objects)  # [N*T, D]
         
-        # Compute statistics with more conservative approach for diffusion
-        # Use 95th percentile for std to avoid outliers affecting normalization
-        def robust_std(data):
-            mean = np.mean(data, axis=0)
-            # Use 95th percentile of absolute deviations for more robust std
-            abs_dev = np.abs(data - mean)
-            std = np.percentile(abs_dev, 95, axis=0) / 1.96  # Convert to std equivalent
-            return mean, std + 1e-8
-        
-        left_mean, left_std = robust_std(all_left_data)
-        right_mean, right_std = robust_std(all_right_data)
-        object_mean, object_std = robust_std(all_object_data)
+        # Use standard normalization approach
+        left_mean = np.mean(all_left_data, axis=0)
+        left_std = np.std(all_left_data, axis=0)
+        right_mean = np.mean(all_right_data, axis=0)
+        right_std = np.std(all_right_data, axis=0)
+        object_mean = np.mean(all_object_data, axis=0)
+        object_std = np.std(all_object_data, axis=0)
         
         # Ensure minimum std to prevent division by very small values
-        min_std = 0.01
+        min_std = 1e-6
         left_std = np.maximum(left_std, min_std)
         right_std = np.maximum(right_std, min_std)
         object_std = np.maximum(object_std, min_std)
@@ -253,7 +282,7 @@ class HandToObjectDataset(Dataset):
             'object_std': object_std,
         }
         
-        print("Computed robust normalization statistics")
+        print("Computed normalization statistics")
         print(f"Object trajectory - Mean range: [{object_mean.min():.3f}, {object_mean.max():.3f}]")
         print(f"Object trajectory - Std range: [{object_std.min():.3f}, {object_std.max():.3f}]")
     
@@ -344,7 +373,10 @@ def create_hand_to_object_dataset(
     single_demo=None,
     single_object=None,
     motion_threshold=0.01,
-    sampling_strategy='balanced'
+    sampling_strategy='balanced',
+    split='train',
+    val_split_ratio=0.2,
+    augment=False
 ):
     """
     Convenience function to create HandToObjectDataset.
@@ -357,6 +389,9 @@ def create_hand_to_object_dataset(
         single_object: For overfitting, specify single object ID
         motion_threshold: Threshold for motion detection
         sampling_strategy: 'balanced', 'motion_only', or 'random'
+        split: 'train', 'val', or 'all'
+        val_split_ratio: Fraction of data for validation
+        augment: Whether to apply data augmentation
     """
     return HandToObjectDataset(
         data_path=data_path,
@@ -365,7 +400,10 @@ def create_hand_to_object_dataset(
         single_demo=single_demo,
         single_object=single_object,
         motion_threshold=motion_threshold,
-        sampling_strategy=sampling_strategy
+        sampling_strategy=sampling_strategy,
+        split=split,
+        val_split_ratio=val_split_ratio,
+        augment=augment
     )
 
 
