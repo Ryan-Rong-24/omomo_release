@@ -9,7 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 import cv2
 
-from quaternion import quat_from_6v
+from .quaternion import quat_from_6v
 
 def load_numpy_data(file_path):
     """Load numpy data from file."""

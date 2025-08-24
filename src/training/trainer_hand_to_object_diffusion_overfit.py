@@ -11,6 +11,7 @@ import pickle
 import random
 
 from manip.model.transformer_hand_to_object_diffusion_model import CondGaussianDiffusion
+from src.visualization import VisualizationManager
 
 def load_pickle(path):
     """Load and return the object stored in a pickle file."""
@@ -435,6 +436,9 @@ def train_overfit(opt, device):
     
     windows_seen = set()
     
+    # Initialize Rerun visualization if requested
+    visualizer = VisualizationManager(opt, dataset)
+
     for step in range(opt.num_steps):
         optimizer.zero_grad()
 
@@ -488,6 +492,13 @@ def train_overfit(opt, device):
                     'eval_max_error': eval_max_error
                 }
                 print(f"  New best model at step {step} with eval error {eval_mean_error:.4f}m (previous: {best_eval_error:.4f}m)")
+                
+                # Visualize best model prediction
+                visualizer.visualize_best_model_prediction(
+                    step, left_hand, right_hand, object_motion, 
+                    seq_len, data_dict['is_moving'], data_dict['mean_velocity'], 
+                    diffusion_model, device
+                )
             
             if opt.use_wandb:
                 wandb.log({
@@ -524,6 +535,15 @@ def train_overfit(opt, device):
             }
             torch.save(checkpoint, os.path.join(wdir, f'model-{step}.pt'))
 
+        # Visualize training frame (with configurable frequency)
+        if step % opt.visualization_frequency == 0:
+            visualizer.visualize_training_step(
+                step, left_hand, right_hand, object_motion,
+                seq_len=seq_len, 
+                is_moving=data_dict['is_moving'], 
+                mean_velocity=data_dict['mean_velocity']
+            )
+
     print("Training completed!")
     print(f"Best model: step {best_step} with eval error {best_eval_error:.4f}m")
 
@@ -550,6 +570,9 @@ def train_overfit(opt, device):
         print(f"  Mean position error: {final_mean_error:.4f} meters")
         print(f"  Max position error: {final_max_error:.4f} meters")
         print(f"  Evaluated on {len(dataset.window_data)} windows")
+        
+        # Visualize best model evaluation
+        visualizer.visualize_evaluation_samples(diffusion_model, device, num_samples=5)
     else:
         print("No best model found, using final model for inference")
         final_mean_error, final_max_error = evaluate_model(diffusion_model, dataset, device, num_eval_windows=len(dataset.window_data))
@@ -567,7 +590,7 @@ def train_overfit(opt, device):
     
     # Save results - full trajectory
     save_path = os.path.join(opt.save_dir, 'sampled_motion.npy')
-    np.save(save_path, sampled_motion_full.unsqueeze(0).numpy())  # Add batch dim for compatibility
+    np.save(save_path, sampled_motion_full.unsqueeze(0).numpy())
     print(f"Saved full sampled motion to {save_path}")
 
     # Save input hand poses and ground truth - full trajectory
@@ -597,7 +620,15 @@ def train_overfit(opt, device):
         f.write(f"Window size: {opt.window}\n")
         f.write(f"Use velocity: {opt.use_velocity}\n")
         f.write(f"Data dimension: {dataset.pose_dim}D\n")
+        f.write(f"Rerun visualization: {'Enabled' if opt.use_rerun else 'Disabled'}\n")
+        if opt.use_rerun:
+            f.write(f"Enhanced scene visualization: Enabled\n")
+            f.write(f"MANO hand models: Enabled\n")
+            f.write(f"Hand articulations: Enabled\n")
     print(f"Saved training summary to {summary_path}")
+    
+    # Rerun visualization summary
+    print(visualizer.get_summary())
 
     if opt.use_wandb:
         wandb.log({
@@ -608,6 +639,12 @@ def train_overfit(opt, device):
             "final/final_max_error": final_max_error
         })
         wandb.finish()
+
+    # Visualize final full trajectory
+    visualizer.visualize_final_results(sampled_motion_full)
+    
+    # Cleanup visualization resources
+    visualizer.cleanup()
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -640,6 +677,14 @@ def parse_opt():
     parser.add_argument('--entity', type=str, default='egorecon', help='Wandb entity name')
     parser.add_argument('--exp_name', type=str, default='overfit_with_velocity', help='Experiment name')
     parser.add_argument('--use_wandb', action='store_true', help='Use wandb for logging')
+    parser.add_argument('--use_rerun', action='store_true', help='Use Rerun for real-time visualization')
+    
+    # Visualization parameters
+    parser.add_argument('--mano_models_dir', type=str, default='data/mano_models', help='Directory containing MANO model files')
+    parser.add_argument('--hand_articulations_path', type=str, default='data/hand_articulations.pkl', help='Path to hand articulations pickle file')
+    parser.add_argument('--generation_data_path', type=str, default='data/generation.pkl', help='Path to generation data pickle file')
+    parser.add_argument('--visualization_frequency', type=int, default=100, help='How often to save visualization files (steps)')
+    parser.add_argument('--enhanced_scene_frames', type=int, default=500, help='Number of frames for enhanced scene visualization')
     
     opt = parser.parse_args()
     return opt

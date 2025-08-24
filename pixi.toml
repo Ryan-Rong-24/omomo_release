@@ -1,0 +1,84 @@
+[project]
+name = "omomo-hot3d"
+version = "0.1.0"
+description = "OMOMO diffusion transformer with Hot3D dataset API"
+authors = ["Hot3D + OMOMO Integration"]
+channels = ["conda-forge", "pytorch", "nvidia"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+[system-requirements]
+libc = { family="glibc", version="2.30" }
+
+[tasks]
+# Hot3D specific setup for hands
+setup_for_hands = """
+    python3 -m pip install 'git+https://github.com/vchoutas/smplx';
+    python3 -m pip install 'git+https://github.com/mattloper/chumpy';
+    """
+
+# Rerun visualization
+rerun_viewer = "rerun --web-viewer --port 9876"
+visualize_data = "python3 rerun_adapted.py"
+
+# Original hot3d viewer
+hot3d_viewer = "python3 hot3d/hot3d/viewer.py"
+
+# Data inspection
+inspect_data = "python3 inspect_data.py"
+inspect_detailed = "python3 inspect_data_detailed.py"
+
+# Note:
+# Getting chumpy and smplx from git matters to have last update that have not been pushed to pypi
+# See chumpy https://github.com/mattloper/chumpy/issues/55
+
+[dependencies]
+# Python and core tools
+pip = "*"
+python = "==3.10"
+
+# Hot3D specific dependencies
+rerun-sdk = ">=0.18.0"
+matplotlib = "*"
+
+# PyTorch ecosystem (for both Hot3D and OMOMO)
+pytorch = "~=2.1.2"
+torchvision = "*"
+
+# Scientific computing
+numpy = "*"
+scipy = "*"
+scikit-learn = "*"
+scikit-image = "*"
+
+# Computer vision and image processing
+opencv = "*"
+
+# 3D processing
+trimesh = "*"
+
+# Utilities
+joblib = "*"
+tqdm = "*"
+requests = "*"
+
+[pypi-dependencies]
+# Hot3D specific
+projectaria_tools = "~=1.5.2"
+vrs = "*"
+
+# OMOMO requirements from requirements.txt
+imageio = ">=2.19.3"
+imageio-ffmpeg = ">=0.4.7"
+scenepic = "==1.1.1"
+torchgeometry = "*"
+wandb = ">=0.12.21"
+ema-pytorch = ">=0.0.10"
+einops = ">=0.4.1"
+pyopengl = ">=3.1.0"
+
+# Additional dependencies that might be needed
+# (These are commonly used with the above packages)
+torchaudio = "*"
+pillow = "*"
+h5py = "*"
+PyYAML = "*"

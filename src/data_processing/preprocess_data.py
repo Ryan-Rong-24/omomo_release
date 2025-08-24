@@ -4,7 +4,7 @@ import pickle
 import torch
 import numpy as np
 from pathlib import Path
-from quaternion import quat_to_6v
+from ..utils.quaternion import quat_to_6v
 import os
 
 def load_pickle(path):

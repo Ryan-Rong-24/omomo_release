@@ -10,8 +10,7 @@ from inspect import isfunction
 
 import torch
 from torch import nn, Tensor
-import torch.nn.functional as F
-import pytorch3d.transforms as transforms 
+import torch.nn.functional as F 
 
 from manip.model.transformer_module import Decoder 
 

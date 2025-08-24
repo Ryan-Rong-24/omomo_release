@@ -7,7 +7,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from pathlib import Path
 from tqdm import tqdm
 
-from quaternion import quat_from_6v
+from .quaternion import quat_from_6v
 
 def load_numpy_data(file_path):
     """Load numpy data from file."""
