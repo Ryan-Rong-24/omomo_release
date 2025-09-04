@@ -6,37 +6,46 @@ import pickle
 import numpy as np
 import rerun as rr
 import torch
+import shutil
+from pathlib import Path
+
+# Constants for MANO model paths
+MANO_LEFT_SRC = "/home/yufeiy2_egorecon/omomo_release/data/mano_models/MANO_LEFT.pkl"
+MANO_RIGHT_SRC = "/home/yufeiy2_egorecon/omomo_release/data/mano_models/MANO_RIGHT.pkl"
+MANO_TEMP_DIR = "/tmp/mano_models"
 
 def load_mano_models():
     """Load MANO models for hand mesh generation"""
     try:
         import smplx
         
-        # Create a temporary directory structure that SMPLX expects
-        mano_dir = "/tmp/mano_models"
-        os.makedirs(mano_dir, exist_ok=True)
+        # Create temporary directory structure that SMPLX expects
+        os.makedirs(MANO_TEMP_DIR, exist_ok=True)
         
-        # Copy the pkl files to expected locations
-        import shutil
-        left_src = "/home/yufeiy2_egorecon/omomo_release/data/mano_models/MANO_LEFT.pkl"
-        right_src = "/home/yufeiy2_egorecon/omomo_release/data/mano_models/MANO_RIGHT.pkl"
+        # Check if source files exist
+        if not os.path.exists(MANO_LEFT_SRC) or not os.path.exists(MANO_RIGHT_SRC):
+            raise FileNotFoundError(f"MANO model files not found at {MANO_LEFT_SRC} or {MANO_RIGHT_SRC}")
         
-        left_dst = os.path.join(mano_dir, "MANO_LEFT.pkl")
-        right_dst = os.path.join(mano_dir, "MANO_RIGHT.pkl")
+        # Copy MANO model files to expected locations
+        mano_files = {
+            "MANO_LEFT.pkl": MANO_LEFT_SRC,
+            "MANO_RIGHT.pkl": MANO_RIGHT_SRC
+        }
         
-        shutil.copy2(left_src, left_dst)
-        shutil.copy2(right_src, right_dst)
+        for filename, src_path in mano_files.items():
+            dst_path = os.path.join(MANO_TEMP_DIR, filename)
+            shutil.copy2(src_path, dst_path)
         
         # Load MANO models
         left_mano = smplx.MANO(
-            model_path=left_dst,
+            model_path=os.path.join(MANO_TEMP_DIR, "MANO_LEFT.pkl"),
             is_rhand=False,
             use_pca=False,
             flat_hand_mean=True
         )
         
         right_mano = smplx.MANO(
-            model_path=right_dst,
+            model_path=os.path.join(MANO_TEMP_DIR, "MANO_RIGHT.pkl"),
             is_rhand=True,
             use_pca=False,
             flat_hand_mean=True

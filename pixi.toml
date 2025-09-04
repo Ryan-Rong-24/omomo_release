@@ -6,6 +6,9 @@ authors = ["Hot3D + OMOMO Integration"]
 channels = ["conda-forge", "pytorch", "nvidia"]
 platforms = ["linux-64", "osx-arm64", "osx-64"]
 
+[tool.pixi.pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu124"]
+
 [system-requirements]
 libc = { family="glibc", version="2.30" }
 
@@ -40,9 +43,8 @@ python = "==3.10"
 rerun-sdk = ">=0.18.0"
 matplotlib = "*"
 
-# PyTorch ecosystem (for both Hot3D and OMOMO)
-pytorch = "~=2.1.2"
-torchvision = "*"
+# PyTorch ecosystem (for both Hot3D and OMOMO) - CUDA enabled via PyPI
+# pytorch = "~=2.1.2"  # Commented out - using PyPI instead
 
 # Scientific computing
 numpy = "*"
@@ -60,6 +62,7 @@ trimesh = "*"
 joblib = "*"
 tqdm = "*"
 requests = "*"
+einops = ">=0.8.1,<0.9"
 
 [pypi-dependencies]
 # Hot3D specific
@@ -78,7 +81,12 @@ pyopengl = ">=3.1.0"
 
 # Additional dependencies that might be needed
 # (These are commonly used with the above packages)
-torchaudio = "*"
 pillow = "*"
 h5py = "*"
 PyYAML = "*"
+
+# PyPI dependencies for CUDA-enabled PyTorch
+[tool.pixi.pypi-dependencies]
+torch = "*"
+torchvision = "*"
+torchaudio = "*"

@@ -1,484 +1,358 @@
 #!/usr/bin/env python3
-"""Modular Rerun visualizer for hand-to-object training and visualization"""
+"""Concise Rerun visualizer based on proven working code"""
 
 import os
 import pickle
 import numpy as np
 import rerun as rr
 import torch
+import shutil
 from pathlib import Path
 
 class RerunVisualizer:
-    """Modular Rerun visualizer for training and evaluation"""
+    """Concise Rerun visualizer for hand-to-object training"""
     
     def __init__(self, exp_name, save_dir, enable_visualization=True, 
-                 mano_models_dir=None, hand_articulations_path=None, generation_data_path=None):
-        """Initialize Rerun visualizer
-        
-        Args:
-            exp_name: Name of the experiment
-            save_dir: Directory to save Rerun files
-            enable_visualization: Whether to enable Rerun visualization
-            mano_models_dir: Directory containing MANO model files (optional)
-            hand_articulations_path: Path to hand articulations pickle file (optional)
-            generation_data_path: Path to generation data pickle file (optional)
-        """
+                 mano_models_dir="data/mano_models", object_mesh_dir="data/object_meshes",
+                 use_hand_articulations=False, hand_articulations_path="data/hand_articulations.pkl"):
+        """Initialize visualizer"""
         self.exp_name = exp_name
         self.save_dir = Path(save_dir)
         self.enable_visualization = enable_visualization
+        self.mano_models_dir = Path(mano_models_dir)
+        self.object_mesh_dir = Path(object_mesh_dir)
+        self.use_hand_articulations = use_hand_articulations
+        self.hand_articulations_path = Path(hand_articulations_path)
+        
         self.rerun_dir = None
         self.left_mano = None
         self.right_mano = None
-        
-        # Configurable paths with defaults
-        self.mano_models_dir = Path(mano_models_dir) if mano_models_dir else Path("data/mano_models")
-        self.hand_articulations_path = Path(hand_articulations_path) if hand_articulations_path else Path("data/hand_articulations.pkl")
-        self.generation_data_path = Path(generation_data_path) if generation_data_path else Path("data/generation.pkl")
+        self.hand_articulations = None
+        self.object_meshes = {}  # Cache loaded meshes
         
         if self.enable_visualization:
-            self._setup_rerun()
-            self._load_mano_models()
+            self._setup()
     
-    def _setup_rerun(self):
-        """Initialize Rerun visualization"""
+    def _setup(self):
+        """Setup Rerun and load models"""
         try:
             # Initialize Rerun
-            rr.init(f"HandToObject_Training_{self.exp_name}")
-            
-            # Create output directory for Rerun files
+            rr.init(f"HandToObject_{self.exp_name}")
             self.rerun_dir = self.save_dir / "rerun_visualizations"
             self.rerun_dir.mkdir(parents=True, exist_ok=True)
             
-            print(f"✓ Rerun visualization initialized")
-            print(f"  Output directory: {self.rerun_dir}")
+            # Start recording immediately (like the working version)
+            main_output_file = self.rerun_dir / "training_session.rrd"
+            rr.save(str(main_output_file))
+            
+            # Load MANO models
+            self._load_mano_models()
+            
+            # Load hand articulations if requested
+            if self.use_hand_articulations:
+                self._load_hand_articulations()
+            
+            print(f"✓ RerunVisualizer ready: MANO={'✓' if self.left_mano else '✗'}, "
+                  f"Articulations={'✓' if self.hand_articulations else '✗'}")
             
         except Exception as e:
-            print(f"⚠️  Failed to initialize Rerun: {e}")
-            print("  Training will continue without visualization")
+            print(f"⚠️ Visualization setup failed: {e}")
             self.enable_visualization = False
-            self.rerun_dir = None
     
     def _load_mano_models(self):
-        """Load MANO models for hand mesh generation"""
+        """Load MANO models using proven working method"""
         try:
             import smplx
             
-            # Check if MANO models directory exists
-            if not self.mano_models_dir.exists():
-                print(f"⚠️  MANO models directory not found: {self.mano_models_dir}")
-                return
-            
-            # Create a temporary directory structure that SMPLX expects
-            mano_dir = "/tmp/mano_models"
-            os.makedirs(mano_dir, exist_ok=True)
-            
-            # Copy the pkl files to expected locations
-            import shutil
+            # Check files exist
             left_src = self.mano_models_dir / "MANO_LEFT.pkl"
             right_src = self.mano_models_dir / "MANO_RIGHT.pkl"
             
             if not left_src.exists() or not right_src.exists():
-                print(f"⚠️  MANO model files not found in {self.mano_models_dir}")
+                print(f"⚠️ MANO files not found in {self.mano_models_dir}")
                 return
             
-            left_dst = os.path.join(mano_dir, "MANO_LEFT.pkl")
-            right_dst = os.path.join(mano_dir, "MANO_RIGHT.pkl")
+            # Create temp directory (proven working method)
+            mano_temp_dir = "/tmp/mano_models"
+            os.makedirs(mano_temp_dir, exist_ok=True)
             
-            shutil.copy2(str(left_src), left_dst)
-            shutil.copy2(str(right_src), right_dst)
+            # Copy files
+            shutil.copy2(str(left_src), os.path.join(mano_temp_dir, "MANO_LEFT.pkl"))
+            shutil.copy2(str(right_src), os.path.join(mano_temp_dir, "MANO_RIGHT.pkl"))
             
-            # Load MANO models
+            # Load models
             self.left_mano = smplx.MANO(
-                model_path=left_dst,
-                is_rhand=False,
-                use_pca=False,
-                flat_hand_mean=True
+                model_path=os.path.join(mano_temp_dir, "MANO_LEFT.pkl"),
+                is_rhand=False, use_pca=False, flat_hand_mean=True
             )
-            
             self.right_mano = smplx.MANO(
-                model_path=right_dst,
-                is_rhand=True,
-                use_pca=False,
-                flat_hand_mean=True
+                model_path=os.path.join(mano_temp_dir, "MANO_RIGHT.pkl"),
+                is_rhand=True, use_pca=False, flat_hand_mean=True
             )
             
-            print("✓ MANO models loaded successfully")
-            
+        except ImportError:
+            print("⚠️ smplx not available")
         except Exception as e:
-            print(f"✗ Failed to load MANO models: {e}")
-            self.left_mano = None
-            self.right_mano = None
+            print(f"⚠️ MANO loading failed: {e}")
     
-    def load_hand_articulations(self):
-        """Load the extracted hand articulation data"""
+    def _load_hand_articulations(self):
+        """Load hand articulations data"""
         if not self.hand_articulations_path.exists():
-            print(f"⚠️  Hand articulations file not found: {self.hand_articulations_path}")
-            return None
+            print(f"⚠️ Hand articulations not found: {self.hand_articulations_path}")
+            return
         
         try:
             with open(self.hand_articulations_path, 'rb') as f:
-                data = pickle.load(f)
-            print(f"✓ Loaded hand articulations from {len(data)} sequences")
-            return data
+                self.hand_articulations = pickle.load(f)
+            print(f"✓ Loaded hand articulations from {len(self.hand_articulations)} sequences")
         except Exception as e:
-            print(f"⚠️  Error loading hand articulations: {e}")
+            print(f"⚠️ Hand articulations loading failed: {e}")
+    
+    def load_object_mesh(self, object_id):
+        """Load object mesh using proven working method"""
+        if object_id in self.object_meshes:
+            return self.object_meshes[object_id]
+        
+        try:
+            import trimesh
+            
+            # Look for GLB files (proven to work)
+            mesh_path = self.object_mesh_dir / f"{object_id}.glb"
+            if not mesh_path.exists():
+                return None
+            
+            # Load mesh
+            mesh = trimesh.load(mesh_path)
+            
+            # Handle Scene objects (GLB files load as scenes)
+            if hasattr(mesh, 'geometry') and mesh.geometry:
+                # Get the first geometry from the scene
+                geometry = list(mesh.geometry.values())[0]
+                mesh_data = {
+                    'vertices': geometry.vertices,
+                    'faces': geometry.faces,
+                    'path': mesh_path
+                }
+            else:
+                # Direct mesh object
+                mesh_data = {
+                    'vertices': mesh.vertices,
+                    'faces': mesh.faces,
+                    'path': mesh_path
+                }
+            
+            self.object_meshes[object_id] = mesh_data
+            return mesh_data
+            
+        except ImportError:
+            print("⚠️ trimesh not available for GLB loading")
+            return None
+        except Exception as e:
+            print(f"⚠️ Mesh loading failed for {object_id}: {e}")
             return None
     
-    def visualize_training_frame(self, step, left_hand, right_hand, object_motion_gt, 
-                               object_motion_pred=None, seq_len=None, is_moving=None, mean_velocity=None):
-        """Visualize a single training frame in Rerun"""
-        if not self.enable_visualization or self.rerun_dir is None:
-            return
-        
-        try:
-            # Set time for this frame
-            rr.set_time("training_step", sequence=step)
-            
-            # Extract positions (first 3 dimensions)
-            left_pos = left_hand[0, :, 0:3].cpu().numpy()  # [T, 3]
-            right_pos = right_hand[0, :, 3:6].cpu().numpy()  # [T, 3]
-            object_pos_gt = object_motion_gt[0, :, 0:3].cpu().numpy()  # [T, 3]
-            
-            # Log hand trajectories
-            rr.log(
-                "training/left_hand_trajectory",
-                rr.LineStrips3D([left_pos], colors=[[0, 255, 0]], radii=[0.01])
-            )
-            
-            rr.log(
-                "training/right_hand_trajectory", 
-                rr.LineStrips3D([right_pos], colors=[[0, 0, 255]], radii=[0.01])
-            )
-            
-            # Log ground truth object trajectory
-            rr.log(
-                "training/object_gt_trajectory",
-                rr.LineStrips3D([object_pos_gt], colors=[[255, 0, 0]], radii=[0.015])
-            )
-            
-            # Log predicted object trajectory if available
-            if object_motion_pred is not None:
-                object_pos_pred = object_motion_pred[0, :, 0:3].cpu().numpy()
-                rr.log(
-                    "training/object_pred_trajectory",
-                    rr.LineStrips3D([object_pos_pred], colors=[[255, 165, 0]], radii=[0.015])
-                )
-            
-            # Log current positions as points
-            rr.log(
-                "training/left_hand_current",
-                rr.Points3D([left_pos[-1]], colors=[[0, 255, 0]], radii=[0.02])
-            )
-            
-            rr.log(
-                "training/right_hand_current",
-                rr.Points3D([right_pos[-1]], colors=[[0, 0, 255]], radii=[0.02])
-            )
-            
-            rr.log(
-                "training/object_gt_current",
-                rr.Points3D([object_pos_gt[-1]], colors=[[255, 0, 0]], radii=[0.025])
-            )
-            
-            if object_motion_pred is not None:
-                rr.log(
-                    "training/object_pred_current",
-                    rr.Points3D([object_pos_pred[-1]], colors=[[255, 165, 0]], radii=[0.025])
-                )
-            
-            # Log metadata
-            if seq_len is not None:
-                rr.log("training/metadata", rr.TextDocument(f"Step: {step}, Seq Length: {seq_len.item()}"))
-            
-            if is_moving is not None:
-                motion_status = "Moving" if is_moving else "Stationary"
-                rr.log("training/motion_status", rr.TextDocument(f"Motion: {motion_status}"))
-            
-            if mean_velocity is not None:
-                rr.log("training/velocity", rr.TextDocument(f"Mean Velocity: {mean_velocity:.4f}"))
-            
-            # Save Rerun file periodically
-            if step % 1000 == 0:
-                output_file = self.rerun_dir / f"training_step_{step}.rrd"
-                rr.save(str(output_file))
-                
-        except Exception as e:
-            print(f"⚠️  Rerun visualization error: {e}")
+    def _apply_coordinate_transform(self, position):
+        """Apply coordinate transformation (from proven working code)"""
+        transform_matrix = np.array([
+            [1, 0, 0],  # X stays the same
+            [0, 1, 0],  # Y becomes -Z
+            [0, 0, 1]   # Z becomes Y
+        ])
+        return transform_matrix @ position
     
-    def visualize_full_trajectory(self, dataset, sampled_motion, step_name="final"):
-        """Visualize the full trajectory comparison"""
-        if not self.enable_visualization or self.rerun_dir is None:
+    def log_training_step(self, step, left_hand, right_hand, object_gt, 
+                         object_pred=None, seq_len=None, is_moving=None, mean_velocity=None):
+        """Log training step with trajectories and MANO hands"""
+        if not self.enable_visualization:
             return
         
         try:
-            # Set time for this visualization
-            rr.set_time("full_trajectory", sequence=0)
+            # Handle both integer and string step values
+            if isinstance(step, str):
+                # Extract numeric part from strings like "best_1000" or "eval_5"
+                import re
+                numeric_part = re.findall(r'\d+', step)
+                step_num = int(numeric_part[0]) if numeric_part else 0
+            else:
+                step_num = step
+            
+            rr.set_time("training_step", sequence=step_num)
             
             # Extract positions
-            left_hand_full = dataset.left_hand_full[:, 0:3].numpy()  # [T, 3]
-            right_hand_full = dataset.right_hand_full[:, 0:3].numpy()  # [T, 3]
-            object_gt_full = dataset.object_motion_full[:, 0:3].numpy()  # [T, 3]
-            object_pred_full = sampled_motion[:, 0:3].numpy()  # [T, 3]
+            left_pos = left_hand[0, :, :3].cpu().numpy()  # [T, 3]
+            right_pos = right_hand[0, :, :3].cpu().numpy()
+            object_pos_gt = object_gt[0, :, :3].cpu().numpy()
             
-            # Log full trajectories
-            rr.log(
-                f"full_trajectory/{step_name}/left_hand",
-                rr.LineStrips3D([left_hand_full], colors=[[0, 255, 0]], radii=[0.008])
-            )
+            # Apply valid length
+            valid_len = seq_len.item() if seq_len is not None else len(left_pos)
+            valid_len = min(valid_len, len(left_pos), len(right_pos), len(object_pos_gt))
             
-            rr.log(
-                f"full_trajectory/{step_name}/right_hand",
-                rr.LineStrips3D([right_hand_full], colors=[[0, 0, 255]], radii=[0.008])
-            )
+            left_pos = left_pos[:valid_len]
+            right_pos = right_pos[:valid_len]
+            object_pos_gt = object_pos_gt[:valid_len]
             
-            rr.log(
-                f"full_trajectory/{step_name}/object_ground_truth",
-                rr.LineStrips3D([object_gt_full], colors=[[255, 0, 0]], radii=[0.012])
-            )
+            # Log trajectories
+            rr.log("training/left_hand_traj", rr.LineStrips3D([left_pos], colors=[[0, 255, 0]], radii=[0.01]))
+            rr.log("training/right_hand_traj", rr.LineStrips3D([right_pos], colors=[[0, 0, 255]], radii=[0.01]))
+            rr.log("training/object_gt_traj", rr.LineStrips3D([object_pos_gt], colors=[[255, 0, 0]], radii=[0.015]))
             
-            rr.log(
-                f"full_trajectory/{step_name}/object_predicted",
-                rr.LineStrips3D([object_pred_full], colors=[[255, 165, 0]], radii=[0.012])
-            )
+            # Log prediction if available
+            if object_pred is not None:
+                object_pos_pred = object_pred[0, :valid_len, :3].cpu().numpy()
+                rr.log("training/object_pred_traj", rr.LineStrips3D([object_pos_pred], colors=[[255, 165, 0]], radii=[0.015]))
             
-            # Log trajectory statistics
-            trajectory_length = len(object_gt_full)
-            mean_gt_velocity = np.mean(np.linalg.norm(np.diff(object_gt_full, axis=0), axis=1))
-            mean_pred_velocity = np.mean(np.linalg.norm(np.diff(object_pred_full, axis=0), axis=1))
+            # Log MANO hands at current position
+            if valid_len > 0 and self.left_mano is not None:
+                self._log_mano_hands(left_pos[-1], right_pos[-1])
             
-            rr.log(
-                f"full_trajectory/{step_name}/stats",
-                rr.TextDocument(f"Length: {trajectory_length} frames\nGT Mean Vel: {mean_gt_velocity:.4f}\nPred Mean Vel: {mean_pred_velocity:.4f}")
-            )
+            # Log metadata
+            metadata = f"Step: {step}"
+            if seq_len is not None:
+                metadata += f", Seq: {seq_len.item()}"
+            if is_moving is not None:
+                metadata += f", Moving: {is_moving}"
+            if mean_velocity is not None:
+                metadata += f", Vel: {mean_velocity:.4f}"
+            rr.log("training/info", rr.TextDocument(metadata))
             
-            # Save full trajectory visualization
-            output_file = self.rerun_dir / f"full_trajectory_{step_name}.rrd"
-            rr.save(str(output_file))
-            print(f"✓ Saved full trajectory visualization: {output_file}")
-            
+            # Note: We're recording continuously to training_session.rrd, no need for periodic saves
+                
         except Exception as e:
-            print(f"⚠️  Full trajectory visualization error: {e}")
+            print(f"⚠️ Training step logging failed: {e}")
     
-    def visualize_enhanced_scene(self, dataset, sequence_key=None, num_frames=500):
-        """Create enhanced Rerun visualization with hand articulations and objects"""
-        if not self.enable_visualization or self.rerun_dir is None:
+    def _log_mano_hands(self, left_pos, right_pos):
+        """Log MANO hand meshes at positions"""
+        try:
+            # Left hand
+            with torch.no_grad():
+                left_output = self.left_mano()
+                left_vertices = left_output.vertices[0].numpy() + left_pos
+                rr.log("training/left_hand_mesh", 
+                       rr.Mesh3D(vertex_positions=left_vertices, 
+                                triangle_indices=self.left_mano.faces,
+                                vertex_colors=[0.3, 0.8, 0.3]))
+            
+            # Right hand
+            with torch.no_grad():
+                right_output = self.right_mano()
+                right_vertices = right_output.vertices[0].numpy() + right_pos
+                rr.log("training/right_hand_mesh",
+                       rr.Mesh3D(vertex_positions=right_vertices,
+                                triangle_indices=self.right_mano.faces,
+                                vertex_colors=[0.3, 0.3, 0.8]))
+                
+        except Exception as e:
+            print(f"⚠️ MANO hand logging failed: {e}")
+    
+    def log_best_model_prediction(self, step, left_hand, right_hand, object_gt, 
+                                 diffusion_model, device, seq_len=None, is_moving=None, mean_velocity=None):
+        """Generate and log best model prediction"""
+        if not self.enable_visualization:
             return
         
         try:
-            # Load hand articulations
-            hand_articulations = self.load_hand_articulations()
-            
-            # Load basic data
-            if not self.generation_data_path.exists():
-                print(f"⚠️  Generation data file not found: {self.generation_data_path}")
-                return
+            # Generate prediction
+            diffusion_model.eval()
+            with torch.no_grad():
+                hand_poses = torch.cat([left_hand, right_hand], dim=-1)
+                object_init = torch.zeros_like(left_hand)
                 
-            with open(self.generation_data_path, 'rb') as f:
-                basic_data = pickle.load(f)
-            
-            # Try to find a sequence that has detailed hand articulations
-            if sequence_key is None:
-                for seq_key in basic_data.keys():
-                    if hand_articulations and seq_key in hand_articulations:
-                        sequence_key = seq_key
-                        break
-                
-                if sequence_key is None:
-                    sequence_key = list(basic_data.keys())[0]
-            
-            sequence_data = basic_data[sequence_key]
-            print(f"Creating enhanced visualization for: {sequence_key}")
-            
-            # Create output file
-            output_file = self.rerun_dir / f"{sequence_key}_enhanced_hands.rrd"
-            
-            # Initialize rerun
-            rr.init(f"Enhanced_Hands_{sequence_key}")
-            rr.save(str(output_file))
-            
-            # Get basic data
-            left_hand_data = sequence_data['left_hand']
-            right_hand_data = sequence_data['right_hand']
-            object_data = sequence_data['object_pose']
-            
-            # Check if we have detailed hand articulations for this sequence
-            detailed_hands = None
-            if hand_articulations and sequence_key in hand_articulations:
-                detailed_hands = hand_articulations[sequence_key]
-                print(f"✓ Using detailed hand articulations with {len(detailed_hands['left_hand'])} left and {len(detailed_hands['right_hand'])} right hand frames")
-            else:
-                print(f"⚠️  No detailed hand articulations found for {sequence_key}, using basic poses")
-            
-            # Determine number of frames to process
-            if detailed_hands:
-                num_frames = min(num_frames, len(detailed_hands['left_hand']), len(detailed_hands['right_hand']))
-            else:
-                num_frames = min(num_frames, len(left_hand_data), len(right_hand_data))
-            
-            print(f"Processing {num_frames} frames with enhanced hand visualization...")
-            
-            # Process frames
-            for frame_idx in range(num_frames):
-                rr.set_time("frame", sequence=frame_idx)
-                
-                # Enhanced hand visualization
-                if detailed_hands and self.left_mano is not None:
-                    self._visualize_detailed_hands(detailed_hands, frame_idx, "left")
-                    self._visualize_detailed_hands(detailed_hands, frame_idx, "right")
+                # Simple padding mask
+                if seq_len is not None:
+                    actual_seq_len = seq_len + 1
+                    window_size = hand_poses.shape[1]
+                    tmp_mask = torch.arange(window_size + 1, device=device).expand(1, window_size + 1) < actual_seq_len[:, None]
+                    padding_mask = tmp_mask[:, None, :]
                 else:
-                    self._visualize_basic_hands(left_hand_data, right_hand_data, frame_idx)
+                    padding_mask = None
                 
-                # Object visualization
-                if frame_idx < len(object_data) and len(object_data[frame_idx]['poses']) > 0:
-                    self._visualize_objects(object_data[frame_idx])
+                object_pred = diffusion_model.sample(object_init, hand_poses, padding_mask=padding_mask)
             
-            print(f"✓ Created enhanced rerun file: {output_file}")
+            diffusion_model.train()
+            
+            # Log with prediction
+            self.log_training_step(f"best_{step}", left_hand, right_hand, object_gt, 
+                                 object_pred, seq_len, is_moving, mean_velocity)
             
         except Exception as e:
-            print(f"⚠️  Enhanced scene visualization error: {e}")
+            print(f"⚠️ Best model prediction failed: {e}")
     
-    def _visualize_detailed_hands(self, detailed_hands, frame_idx, hand_type):
-        """Visualize detailed hand articulations"""
-        if frame_idx >= len(detailed_hands[f'{hand_type}_hand']):
+    def log_final_trajectory(self, dataset, sampled_trajectory):
+        """Log final trajectory comparison with object mesh"""
+        if not self.enable_visualization:
             return
         
-        frame = detailed_hands[f'{hand_type}_hand'][frame_idx]
-        landmarks = frame.get('landmarks_21')
-        mesh_vertices = frame.get('mesh_vertices')
-        mesh_faces = frame.get('mesh_faces')
-        
-        if landmarks is not None and mesh_vertices is not None:
-            # Apply coordinate transformation
-            landmarks_transformed = []
-            for landmark in landmarks:
-                transformed_pos = self._apply_coordinate_transform(landmark)
-                landmarks_transformed.append(transformed_pos)
+        try:
+            rr.set_time("final", sequence=0)
             
-            mesh_vertices_transformed = []
-            for vertex in mesh_vertices:
-                transformed_vertex = self._apply_coordinate_transform(vertex)
-                mesh_vertices_transformed.append(transformed_vertex)
+            # Get trajectory data
+            left_traj = dataset.left_hand_full[:, :3].numpy()
+            right_traj = dataset.right_hand_full[:, :3].numpy()
+            object_gt_traj = dataset.object_motion_full[:, :3].numpy()
+            object_pred_traj = sampled_trajectory[:, :3].numpy()
             
-            # Log detailed hand mesh
-            color = [0.3, 0.8, 0.3] if hand_type == "left" else [0.3, 0.3, 0.8]
-            rr.log(
-                f"world/hands/{hand_type}_detailed_mesh",
-                rr.Mesh3D(
-                    vertex_positions=mesh_vertices_transformed,
-                    triangle_indices=mesh_faces,
-                    vertex_colors=color
-                ),
-            )
+            # Log trajectories
+            rr.log("final/left_hand", rr.LineStrips3D([left_traj], colors=[[0, 255, 0]], radii=[0.008]))
+            rr.log("final/right_hand", rr.LineStrips3D([right_traj], colors=[[0, 0, 255]], radii=[0.008]))
+            rr.log("final/object_gt", rr.LineStrips3D([object_gt_traj], colors=[[255, 0, 0]], radii=[0.012]))
+            rr.log("final/object_pred", rr.LineStrips3D([object_pred_traj], colors=[[255, 165, 0]], radii=[0.012]))
             
-            # Log hand skeleton
-            if 'landmark_connectivity' in detailed_hands:
-                connectivity = detailed_hands['landmark_connectivity']
-                bone_lines = []
-                for connection in connectivity:
-                    start_idx, end_idx = connection
-                    if start_idx < len(landmarks_transformed) and end_idx < len(landmarks_transformed):
-                        bone_lines.append([landmarks_transformed[start_idx], landmarks_transformed[end_idx]])
-                
-                if bone_lines:
-                    skeleton_color = [[0, 255, 0]] if hand_type == "left" else [[0, 0, 255]]
-                    rr.log(
-                        f"world/hands/{hand_type}_skeleton",
-                        rr.LineStrips3D(bone_lines, colors=skeleton_color, radii=[0.003])
-                    )
+            # Load and visualize object mesh if available
+            object_id = getattr(dataset, 'target_object_id', None)
+            if object_id:
+                mesh = self.load_object_mesh(object_id)
+                if mesh:
+                    # Show mesh at key positions
+                    step_size = max(1, len(object_pred_traj) // 20)  # Show ~20 positions
+                    for i in range(0, len(object_pred_traj), step_size):
+                        # GT mesh
+                        gt_vertices = mesh['vertices'] + object_gt_traj[i]
+                        rr.log(f"final/object_mesh_gt/frame_{i}",
+                               rr.Mesh3D(vertex_positions=gt_vertices,
+                                        triangle_indices=mesh['faces'],
+                                        vertex_colors=[0.8, 0.2, 0.2]))
+                        
+                        # Predicted mesh
+                        pred_vertices = mesh['vertices'] + object_pred_traj[i]
+                        rr.log(f"final/object_mesh_pred/frame_{i}",
+                               rr.Mesh3D(vertex_positions=pred_vertices,
+                                        triangle_indices=mesh['faces'],
+                                        vertex_colors=[0.8, 0.5, 0.1]))
+            
+            print(f"✓ Final visualization logged to continuous recording")
+            
+        except Exception as e:
+            print(f"⚠️ Final trajectory logging failed: {e}")
     
-    def _visualize_basic_hands(self, left_hand_data, right_hand_data, frame_idx):
-        """Visualize basic hand poses using MANO models"""
-        if frame_idx < len(left_hand_data) and self.left_mano is not None:
-            left_frame = left_hand_data[frame_idx]
-            left_translation = np.array(left_frame['translation'])
-            left_rotation_wxyz = left_frame['rotation'][0]
-            
-            # Generate MANO mesh
-            with torch.no_grad():
-                left_output = self.left_mano()
-                hand_mesh_vertices = left_output.vertices[0].numpy()
-                hand_triangles = self.left_mano.faces
-            
-            # Log mesh
-            rr.log(
-                "world/hands/left_basic_mesh",
-                rr.Mesh3D(
-                    vertex_positions=hand_mesh_vertices,
-                    triangle_indices=hand_triangles,
-                    vertex_colors=[0.3, 0.8, 0.3]
-                ),
-            )
+    def setup_for_overfit_training(self, dataset, object_id=None):
+        """Setup for overfit training"""
+        if not self.enable_visualization:
+            return
         
-        if frame_idx < len(right_hand_data) and self.right_mano is not None:
-            right_frame = right_hand_data[frame_idx]
-            right_translation = np.array(right_frame['translation'])
-            right_rotation_wxyz = right_frame['rotation'][0]
-            
-            # Generate MANO mesh
-            with torch.no_grad():
-                right_output = self.right_mano()
-                hand_mesh_vertices = right_output.vertices[0].numpy()
-                hand_triangles = self.right_mano.faces
-            
-            # Log mesh
-            rr.log(
-                "world/hands/right_basic_mesh",
-                rr.Mesh3D(
-                    vertex_positions=hand_mesh_vertices,
-                    triangle_indices=hand_triangles,
-                    vertex_colors=[0.3, 0.3, 0.8]
-                ),
-            )
-    
-    def _visualize_objects(self, frame_object_data):
-        """Visualize objects in the scene"""
-        for obj_data in frame_object_data['poses']:
-            object_uid = obj_data['object_uid']
-            obj_translation = np.array(obj_data['translation'])
-            obj_rotation_wxyz = obj_data['rotation'][0]
-            
-            # Apply coordinate transformation
-            obj_translation_transformed = self._apply_coordinate_transform(obj_translation)
-            
-            # Log object transform
-            rr.log(
-                f"world/objects/object_{object_uid}",
-                rr.Transform3D(
-                    translation=obj_translation_transformed,
-                    rotation=rr.Quaternion(xyzw=obj_rotation_wxyz)
-                )
-            )
-    
-    def _apply_coordinate_transform(self, position):
-        """Apply coordinate system transformation"""
-        # Transform matrix: 90-degree rotation around X-axis
-        transform_matrix = np.array([
-            [1,  0,  0],  # X stays the same
-            [0,  1,  0],  # Y becomes -Z (rotated 90° around X)
-            [0,  0,  1]   # Z becomes Y (rotated 90° around X)
-        ])
-        
-        # Apply transformation to position
-        transformed_position = transform_matrix @ position
-        
-        return transformed_position
+        # Pre-load object mesh if provided
+        if object_id:
+            mesh = self.load_object_mesh(object_id)
+            if mesh:
+                print(f"✓ Pre-loaded object mesh for {object_id}")
     
     def get_summary(self):
-        """Get visualization summary"""
+        """Get concise summary"""
         if not self.enable_visualization:
-            return "Rerun visualization disabled"
+            return "Visualization: Disabled"
         
-        summary = f"🎯 Rerun Visualization Summary:\n"
-        summary += f"  ✓ Real-time training progress visualization\n"
-        summary += f"  ✓ Hand trajectory tracking (left=green, right=blue)\n"
-        summary += f"  ✓ Object motion comparison (GT=red, predicted=orange)\n"
-        summary += f"  ✓ Motion classification (moving/stationary)\n"
-        summary += f"  ✓ Best model prediction visualization\n"
-        summary += f"  ✓ Full trajectory comparison\n"
-        summary += f"  ✓ Enhanced hand articulations with MANO models\n"
+        features = []
+        features.append("Hand trajectories")
+        features.append("Object trajectories")
+        if self.left_mano:
+            features.append("MANO hand meshes")
+        if self.hand_articulations:
+            features.append("Hand articulations")
+        if self.object_meshes:
+            features.append(f"Object meshes ({len(self.object_meshes)})")
         
+        summary = f"🎯 RerunVisualizer: {', '.join(features)}"
         if self.rerun_dir:
-            summary += f"  📁 Files saved to: {self.rerun_dir}\n"
-            summary += f"  🚀 View with: rerun {self.rerun_dir}/full_trajectory_final.rrd --web-viewer --port 9877"
+            summary += f"\n📁 Files: {self.rerun_dir}"
+            summary += f"\n🎆 View: rerun {self.rerun_dir}/training_session.rrd --web-viewer"
         
         return summary
