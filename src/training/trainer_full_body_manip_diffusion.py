@@ -21,7 +21,7 @@ from torch.utils import data
 
 import torch.nn.functional as F
 
-import pytorch3d.transforms as transforms 
+from src.utils.rotation_utils import transforms 
 
 from ema_pytorch import EMA
 from multiprocessing import cpu_count

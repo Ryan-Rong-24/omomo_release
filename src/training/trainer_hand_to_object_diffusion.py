@@ -21,7 +21,7 @@ from torch.utils import data
 
 import torch.nn.functional as F
 
-import pytorch3d.transforms as transforms 
+from src.utils.rotation_utils import transforms 
 
 from ema_pytorch import EMA
 from multiprocessing import cpu_count
@@ -632,87 +632,102 @@ class Trainer(object):
             print(f"Warning: Mesh visualization failed: {e}")
             print("Continuing without mesh visualization...")
 
-    def evaluate_model(self, num_eval_samples=100):
-        """
-        Evaluate the model by computing position and rotation errors.
-        """
-        self.ema.ema_model.eval()
+def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10):
+    """
+    Evaluate the model by sampling from multiple windows and computing trajectory accuracy.
+    Returns dictionary with position, rotation, and combined errors.
+    """
+    diffusion_model.eval()
+    
+    total_position_errors = []
+    total_max_errors = []
+    total_rotation_errors = []
+    total_combined_errors = []
         
-        position_errors = []
-        rotation_errors = []
+    with torch.no_grad():
+        # Evaluate on a subset of windows
+        eval_windows = min(num_eval_windows, len(val_dataset))
         
-        with torch.no_grad():
-            for eval_idx in range(num_eval_samples):
-                if self.test_on_train:
-                    data_dict = next(self.dl)
-                else:
-                    data_dict = next(self.val_dl)
-                    
-                condition = data_dict['condition'].cuda()
-                target = data_dict['target'].cuda()
-                target_raw = data_dict['target_raw'].cuda()
-                
-                bs, num_steps, _ = target.shape
+        for i in range(eval_windows):
+            # Get a window using __getitem__ method
+            sample = val_dataset[i]
+            
+            # Extract data from sample
+            hand_poses = sample['condition'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
+            object_motion_gt = sample['target_raw'].unsqueeze(0).to(device)  # [1, T, D] - unnormalized ground truth
+            seq_len = torch.tensor([hand_poses.shape[1]]).to(device)  # [1] - actual sequence length
+            
+            # Prepare input
+            object_motion_init = torch.zeros_like(sample['target'].unsqueeze(0)).to(device)
                 
                 # Generate padding mask
-                seq_len = torch.full((bs,), num_steps, dtype=torch.long, device=target.device)
-                actual_seq_len = seq_len + 1
-                tmp_mask = torch.arange(self.window+1, device=target.device).expand(bs, self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
-                padding_mask = tmp_mask[:, None, :]
+            actual_seq_len = seq_len + 1
+            window_size = val_dataset.window_size if hasattr(val_dataset, 'window_size') else hand_poses.shape[1]
+            tmp_mask = torch.arange(window_size + 1, device=device).expand(1, window_size + 1) < actual_seq_len[:, None].repeat(1, window_size + 1)
+            padding_mask = tmp_mask[:, None, :]
                 
                 # Sample from model
-                sampled_trajectories = self.ema.ema_model.sample(
-                    target, condition, padding_mask=padding_mask
-                )
-                
-                # Denormalize for evaluation
-                for i in range(bs):
-                    sampled_denorm = torch.tensor(
-                        self.ds.denormalize_data(sampled_trajectories[i].cpu().numpy(), 'object'),
-                        dtype=torch.float32, device=target.device
-                    )
-                    
-                    # Extract positions (first 3 dimensions)
-                    gt_pos = target_raw[i, :, :3]
-                    pred_pos = sampled_denorm[:, :3].to(gt_pos.device)
-                    
-                    # Position error (L2 distance per frame)
-                    pos_error = torch.norm(pred_pos - gt_pos, dim=1).mean().item()
-                    position_errors.append(pos_error)
-                    
-                    # Rotation error (if using rotation data)
-                    if self.ds.pose_dim >= 9:  # Has rotation data
-                        if self.use_velocity:
-                            # 12D format: pos(3) + vel(3) + rot(6)
-                            gt_rot = target_raw[i, :, 6:12]
-                            pred_rot = sampled_denorm[:, 6:12].to(gt_rot.device)
-                        else:
-                            # 9D format: pos(3) + rot(6)
-                            gt_rot = target_raw[i, :, 3:9]
-                            pred_rot = sampled_denorm[:, 3:9].to(gt_rot.device)
-                        
-                        # Convert 6D rotation to matrices and compute angular error
-                        gt_rot_mat = transforms.rotation_6d_to_matrix(gt_rot.reshape(-1, 6))
-                        pred_rot_mat = transforms.rotation_6d_to_matrix(pred_rot.reshape(-1, 6))
-                        
-                        # Compute relative rotation and extract angle
-                        relative_rot = torch.matmul(pred_rot_mat, gt_rot_mat.transpose(-1, -2))
-                        trace = relative_rot.diagonal(offset=0, dim1=-1, dim2=-2).sum(-1)
-                        cos_angle = (trace - 1) / 2
-                        cos_angle = torch.clamp(cos_angle, -1, 1)
-                        angle_error = torch.acos(cos_angle).mean().item()
-                        rotation_errors.append(angle_error)
-        
-        mean_pos_error = np.mean(position_errors)
-        mean_rot_error = np.mean(rotation_errors) if rotation_errors else 0.0
-        
-        print(f"Evaluation Results:")
-        print(f"  Mean Position Error: {mean_pos_error:.4f}m")
-        print(f"  Mean Rotation Error: {mean_rot_error:.4f} rad ({np.degrees(mean_rot_error):.2f}°)")
-        
-        return mean_pos_error, mean_rot_error
+            sampled_motion = diffusion_model.sample(object_motion_init, hand_poses, padding_mask=padding_mask)
+            
+            # Denormalize sampled motion for comparison
+            sampled_motion_denorm = torch.tensor(
+                val_dataset.denormalize_data(sampled_motion[0].cpu().numpy(), 'object'),
+                dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            
+            # Compute position errors (only for valid sequence length)
+            valid_len = seq_len.item()
+            
+            # Extract positions and rotations
+            if val_dataset.use_velocity:
+                # For 12D: translation (0:3), velocity (3:6), rotation (6:12)
+                gt_positions = object_motion_gt[0, :valid_len, 0:3]  # [T, 3]
+                pred_positions = sampled_motion_denorm[0, :valid_len, 0:3]  # [T, 3]
+                gt_rotations = object_motion_gt[0, :valid_len, 6:12]  # [T, 6]
+                pred_rotations = sampled_motion_denorm[0, :valid_len, 6:12]  # [T, 6]
+            else:
+                # For 9D: translation (0:3), rotation (3:9)
+                gt_positions = object_motion_gt[0, :valid_len, 0:3]  # [T, 3]
+                pred_positions = sampled_motion_denorm[0, :valid_len, 0:3]  # [T, 3]
+                gt_rotations = object_motion_gt[0, :valid_len, 3:9]  # [T, 6]
+                pred_rotations = sampled_motion_denorm[0, :valid_len, 3:9]  # [T, 6]
+            
+            # Compute position errors (L2 distance per frame)
+            position_errors = torch.norm(pred_positions - gt_positions, dim=1)  # [T]
+            
+            # Compute rotation errors (L2 distance in 6D rotation space)
+            rotation_errors = torch.norm(pred_rotations - gt_rotations, dim=1)  # [T]
+            
+            # Combined error (weighted sum or separate tracking)
+            combined_errors = position_errors + rotation_errors  # Weight the same for now
+            
+            # Store metrics
+            mean_pos_error = position_errors.mean().item()
+            max_pos_error = position_errors.max().item()
+            mean_rot_error = rotation_errors.mean().item()
+            mean_combined_error = combined_errors.mean().item()
+            
+            total_position_errors.append(mean_pos_error)
+            total_max_errors.append(max_pos_error)
+            total_rotation_errors.append(mean_rot_error)
+            total_combined_errors.append(mean_combined_error)
+    
+    # Compute overall metrics
+    overall_mean_pos_error = sum(total_position_errors) / len(total_position_errors)
+    overall_max_pos_error = max(total_max_errors)
+    overall_mean_rot_error = sum(total_rotation_errors) / len(total_rotation_errors)
+    overall_mean_combined_error = sum(total_combined_errors) / len(total_combined_errors)
+    
+    diffusion_model.train()
+    
+    return {
+        'mean_position_error': overall_mean_pos_error,
+        'max_position_error': overall_max_pos_error,
+        'mean_rotation_error': overall_mean_rot_error,
+        'mean_combined_error': overall_mean_combined_error
+    }
 
-def run_train(opt, device):
+def train_main(opt, device):
     # Prepare Directories
     save_dir = Path(opt.save_dir)
     wdir = save_dir / 'weights'
@@ -722,8 +737,40 @@ def run_train(opt, device):
     with open(save_dir / 'opt.yaml', 'w') as f:
         yaml.safe_dump(vars(opt), f, sort_keys=True)
 
+    # Load datasets with proper train/val split
+    train_dataset = HandToObjectDataset(
+        data_path=opt.data_root_folder,
+        window_size=opt.window,
+        use_velocity=opt.use_velocity,
+        sampling_strategy=opt.sampling_strategy,
+        motion_threshold=opt.motion_threshold,
+        min_motion_frames=opt.min_motion_frames,
+        augment=True,  # Enable data augmentation for training
+        split='train',  # Training split
+        val_split_ratio=0.2,  # 20% for validation
+        split_seed=42  # Reproducible split
+    )
+    
+    val_dataset = HandToObjectDataset(
+        data_path=opt.data_root_folder,
+        window_size=opt.window,
+        use_velocity=opt.use_velocity,
+        sampling_strategy=opt.sampling_strategy,
+        motion_threshold=opt.motion_threshold,
+        min_motion_frames=opt.min_motion_frames,
+        augment=False,  # No augmentation for validation
+        split='val',  # Validation split
+        val_split_ratio=0.2,  # Same ratio for consistency
+        split_seed=42  # Same seed for consistency
+    )
+
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    print(f"Data dimensions: {train_dataset.pose_dim}D")
+    print(f"Using velocity: {train_dataset.use_velocity}")
+
     # Define model dimensions based on data format
-    pose_dim = 12 if opt.use_velocity else 9
+    pose_dim = train_dataset.pose_dim
     repr_dim = pose_dim  # Output dimension (object trajectory)
     input_dim = pose_dim * 2  # Input dimension (left + right hand)
     
@@ -751,19 +798,222 @@ def run_train(opt, device):
    
     diffusion_model.to(device)
 
-    trainer = Trainer(
-        opt,
-        diffusion_model,
-        train_batch_size=opt.batch_size,
-        train_lr=opt.learning_rate,
-        train_num_steps=opt.train_steps,  # Use configurable training steps
-        gradient_accumulate_every=2,
-        ema_decay=0.995,
-        amp=True,
-        results_folder=str(wdir),
-    )
+    # Initialize optimizer and scaler
+    optimizer = Adam(diffusion_model.parameters(), lr=opt.learning_rate, weight_decay=getattr(opt, 'weight_decay', 1e-4))
+    scaler = GradScaler(enabled=True)
+    
+    # Add learning rate scheduler
+    scheduler = CosineAnnealingLR(optimizer, T_max=opt.num_epochs * len(train_dataset), eta_min=1e-6)
+    
+    # Initialize EMA
+    from ema_pytorch import EMA
+    ema = EMA(diffusion_model, beta=0.995, update_every=10)
 
-    trainer.train()
+    # Initialize wandb
+    if opt.use_wandb:
+        wandb.init(
+            config=opt,
+            project=opt.wandb_pj_name,
+            entity=opt.entity,
+            name=opt.exp_name,
+            dir=opt.save_dir
+        )
+
+    # Track best model based on evaluation metrics
+    best_eval_error = float('inf')
+    best_model_state = None
+    best_step = 0
+    
+    # Training parameters
+    train_dataset_size = len(train_dataset)
+    steps_per_epoch = train_dataset_size // opt.batch_size
+    total_epochs = opt.num_epochs
+    total_steps = total_epochs * steps_per_epoch
+    
+    print(f"Training setup:")
+    print(f"  Dataset size: {train_dataset_size} windows")
+    print(f"  Batch size: {opt.batch_size}")
+    print(f"  Steps per epoch: {steps_per_epoch}")
+    print(f"  Total epochs: {total_epochs}")
+    print(f"  Total steps: {total_steps}")
+
+    # Training loop
+    print("Starting training loop...")
+    
+    for epoch in range(total_epochs):
+        # Create data loader for this epoch
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, 
+            batch_size=opt.batch_size, 
+            shuffle=True, 
+            pin_memory=True, 
+            num_workers=4
+        )
+        
+        print(f"\nStarting epoch {epoch + 1}/{total_epochs}")
+        
+        for step_in_epoch, batch in enumerate(train_loader):
+            # Calculate global step for logging and checkpoints
+            global_step = epoch * steps_per_epoch + step_in_epoch
+            
+            optimizer.zero_grad()
+            
+            # Extract data from batch and move to device
+            condition = batch['condition'].to(device)  # [BS, T, 2*D] - left + right hand
+            target = batch['target'].to(device)        # [BS, T, D] - object trajectory
+            
+            bs, num_steps, _ = target.shape
+            
+            # Generate padding mask
+            seq_len = torch.full((bs,), num_steps, dtype=torch.long, device=target.device)
+            actual_seq_len = seq_len + 1  # Add 1 for noise level timestep
+            tmp_mask = torch.arange(opt.window+1, device=target.device).expand(bs, opt.window+1) < actual_seq_len[:, None].repeat(1, opt.window+1)
+            padding_mask = tmp_mask[:, None, :]
+            
+            with autocast(enabled=True):
+                loss = diffusion_model(target, condition, padding_mask=padding_mask)
+                
+                # Check for NaN/inf loss
+                if torch.isnan(loss).item() or torch.isinf(loss).item():
+                    print('WARNING: NaN/Inf loss. Skipping batch...')
+                    continue
+            
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), getattr(opt, 'max_grad_norm', 1.0))
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            # Update EMA
+            ema.update()
+            
+            # Evaluate model periodically
+            if global_step % 1000 == 0 and global_step > 0:
+                print(f"\n  Evaluating model at step {global_step}...")
+                eval_results = evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=50)
+            
+                print(f"  Evaluation Results:")
+                print(f"    Mean position error: {eval_results['mean_position_error']:.4f}m")
+                print(f"    Max position error: {eval_results['max_position_error']:.4f}m") 
+                print(f"    Mean rotation error: {eval_results['mean_rotation_error']:.4f}")
+                print(f"    Mean combined error: {eval_results['mean_combined_error']:.4f}")
+                
+                # Track best model based on evaluation metrics (use combined error)
+                combined_error = eval_results['mean_combined_error']
+                if combined_error < best_eval_error:
+                    best_eval_error = combined_error
+                    best_step = global_step
+                    # Save best model state 
+                    best_model_state = {
+                        'model': diffusion_model.state_dict().copy(),
+                        'ema': ema.state_dict().copy(),
+                        'optimizer': optimizer.state_dict().copy(),
+                        'scaler': scaler.state_dict().copy(),
+                        'scheduler': scheduler.state_dict().copy(),
+                        'step': global_step,
+                        'loss': loss.item(),
+                        'eval_results': eval_results
+                    }
+                    print(f"  New best model at step {global_step} with combined error {combined_error:.4f}")
+                
+                if opt.use_wandb:
+                    wandb.log({
+                        "eval/mean_position_error": eval_results['mean_position_error'],
+                        "eval/max_position_error": eval_results['max_position_error'],
+                        "eval/mean_rotation_error": eval_results['mean_rotation_error'],
+                        "eval/mean_combined_error": eval_results['mean_combined_error'],
+                        "eval/best_combined_error": best_eval_error,
+                        "eval/best_step": best_step
+                    }, step=global_step)
+
+                # Save checkpoint
+                checkpoint = {
+                    'step': global_step,
+                    'model': diffusion_model.state_dict(),
+                    'ema': ema.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }
+                torch.save(checkpoint, os.path.join(wdir, f'model-{global_step}.pt'))
+            
+            # Log training metrics
+            if global_step % 100 == 0:
+                epoch_progress = f"Epoch {epoch + 1}/{total_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}"
+                print(f"Step {global_step} ({epoch_progress}), Loss: {loss.item():.6f}, Best eval error: {best_eval_error:.4f}m (step {best_step})")
+                
+                if opt.use_wandb:
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/learning_rate": optimizer.param_groups[0]['lr'],
+                        "train/best_eval_error": best_eval_error,
+                        "train/best_step": best_step,
+                        "train/current_epoch": epoch + 1,
+                    }, step=global_step)
+    
+    print("Training completed!")
+    print(f"Total epochs completed: {total_epochs}")
+    print(f"Best model: step {best_step} with eval error {best_eval_error:.4f}m")
+
+    # Save best model
+    if best_model_state is not None:
+        best_model_path = os.path.join(wdir, 'best_model.pt')
+        torch.save(best_model_state, best_model_path)
+        print(f"Saved best model to {best_model_path}")
+
+        # Load best model for final evaluation
+        print(f"Loading best model (step {best_step}, eval error {best_eval_error:.4f}m) for final evaluation...")
+        diffusion_model.load_state_dict(best_model_state['model'])
+        
+        # Final comprehensive evaluation
+        print(f"\nFinal evaluation on best model...")
+        final_results = evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=len(val_dataset))
+        print(f"Final evaluation results:")
+        print(f"  Mean position error: {final_results['mean_position_error']:.4f} meters")
+        print(f"  Max position error: {final_results['max_position_error']:.4f} meters")
+        print(f"  Mean rotation error: {final_results['mean_rotation_error']:.4f}")
+        print(f"  Mean combined error: {final_results['mean_combined_error']:.4f}")
+        print(f"  Evaluated on {len(val_dataset)} windows")
+        
+        if opt.use_wandb:
+            wandb.log({
+                "final/total_epochs": total_epochs,
+                "final/total_steps": total_steps,
+                "final/dataset_size": train_dataset_size,
+                "final/best_eval_error": best_eval_error,
+                "final/best_step": best_step,
+                "final/final_mean_error": final_results['mean_combined_error'],
+                "final/final_max_error": final_results['max_position_error'],
+                "final/final_mean_rotation_error": final_results['mean_rotation_error'],
+                "final/final_mean_position_error": final_results['mean_position_error']
+            })
+    
+    # Save training summary
+    summary_path = os.path.join(opt.save_dir, 'training_summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write(f"Training Summary\n")
+        f.write(f"================\n")
+        f.write(f"Total epochs: {total_epochs}\n")
+        f.write(f"Total steps: {total_steps}\n")
+        f.write(f"Dataset size: {train_dataset_size} windows\n")
+        f.write(f"Best step: {best_step}\n")
+        f.write(f"Best eval error: {best_eval_error:.4f}m\n")
+        if best_model_state:
+            f.write(f"Final mean position error: {final_results['mean_position_error']:.4f}m\n")
+            f.write(f"Final max position error: {final_results['max_position_error']:.4f}m\n")
+            f.write(f"Final mean rotation error: {final_results['mean_rotation_error']:.4f}\n")
+            f.write(f"Final mean combined error: {final_results['mean_combined_error']:.4f}\n")
+        f.write(f"Window size: {opt.window}\n")
+        f.write(f"Use velocity: {opt.use_velocity}\n")
+        f.write(f"Data dimension: {train_dataset.pose_dim}D\n")
+    print(f"Saved training summary to {summary_path}")
+    
+    if opt.use_wandb:
+        wandb.finish()
 
     torch.cuda.empty_cache()
 
@@ -843,11 +1093,13 @@ def parse_opt():
     parser.add_argument('--d_v', type=int, default=256, help='value dimension in transformer')
     parser.add_argument('--d_model', type=int, default=512, help='model dimension in transformer')
     
-    # Training control
+    # Training parameters
     parser.add_argument('--checkpoint', type=str, default="", help='checkpoint path to resume from')
-    parser.add_argument('--train_steps', type=int, default=100000, help='number of training steps')  # Increased from 100k
-    parser.add_argument('--max_grad_norm', type=float, default=2.0, help='gradient clipping norm')
+    parser.add_argument('--num_epochs', type=int, default=50, help='number of training epochs')
+    parser.add_argument('--train_steps', type=int, default=100000, help='number of training steps (legacy, use num_epochs instead)')  # Keep for backward compatibility
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='gradient clipping norm')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay for optimizer')
+    parser.add_argument('--use_wandb', action='store_true', help='use wandb for logging')
     
     # Testing parameters
     parser.add_argument("--test_sample_res", action="store_true", help="test sampling results")
@@ -866,4 +1118,4 @@ if __name__ == "__main__":
     if opt.test_sample_res:
         run_sample(opt, device)
     else:
-        run_train(opt, device)
+        train_main(opt, device)

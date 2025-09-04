@@ -11,7 +11,7 @@ import time
 import torch
 from torch.utils.data import Dataset
 
-import pytorch3d.transforms as transforms 
+from src.utils.rotation_utils import transforms 
 
 from bps_torch.bps import bps_torch
 from bps_torch.tools import sample_sphere_uniform

@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 import trimesh
-import pytorch3d.transforms as transforms
+from src.utils.rotation_utils import transforms
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 

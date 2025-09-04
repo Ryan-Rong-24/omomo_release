@@ -1,6 +1,6 @@
 import numpy as np
 import torch 
-import pytorch3d.transforms as transforms
+from src.utils.rotation_utils import transforms
 
 def length(x, axis=-1, keepdims=True):
     """
