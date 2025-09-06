@@ -160,7 +160,7 @@ def quat_between(x, y):
     return res
 
 
-def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, trans2joint_list, parents, n_past=1, floor_z=False):
+def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, n_past=1):
     """
     Re-orients the animation data according to the last frame of past context.
 
@@ -168,28 +168,20 @@ def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, trans2joint_list, parents, n_past=
     :param Q: tensor of local quaternions (Batchsize, Timesteps, Joints, 4)
     :obj_x: N X T X 3
     :obj_q: N X T X 4
-    :trans2joint_list: N X 3 
-    :param parents: list of parents' indices
     :param n_past: number of frames in the past context
     :return: The rotated positions X and quaternions Q
     """
     # Get global quats and global poses (FK)
-    global_q, global_x = quat_fk(Q, X, parents)
-
+    global_q = Q 
+    global_x = X 
+   
     key_glob_Q = global_q[:, n_past - 1 : n_past, 0:1, :]  # (B, 1, 1, 4)
-    if floor_z: 
-        # The floor is on z = xxx. Project the forward direction to xy plane. 
-        forward = np.array([1, 1, 0])[np.newaxis, np.newaxis, np.newaxis, :] * quat_mul_vec(
-            key_glob_Q, np.array([1, 0, 0])[np.newaxis, np.newaxis, np.newaxis, :]
-        ) # In rest pose, x direction is the body left direction, root joint point to left hip joint.  
-    else: 
-        # The floor is on y = xxx. Project the forward direction to xz plane. 
-        forward = np.array([1, 0, 1])[np.newaxis, np.newaxis, np.newaxis, :] * quat_mul_vec(
-            key_glob_Q, np.array([1, 0, 0])[np.newaxis, np.newaxis, np.newaxis, :]
-        ) # In rest pose, x direction is the body left direction, root joint point to left hip joint.  
-        # forward = np.array([1, 0, 1])[np.newaxis, np.newaxis, np.newaxis, :] * quat_mul_vec(
-        #     key_glob_Q, np.array([0, 0, 1])[np.newaxis, np.newaxis, np.newaxis, :]
-        # ) # In rest pose, z direction is forward direction. This also works. 
+   
+    # The floor is on z = xxx. Project the forward direction to xy plane. 
+    forward = np.array([1, 1, 0])[np.newaxis, np.newaxis, np.newaxis, :] * quat_mul_vec(
+        key_glob_Q, np.array([1, 0, 0])[np.newaxis, np.newaxis, np.newaxis, :]
+    ) # In rest pose, x direction is the body left direction, root joint point to left hip joint.  
+   
 
     forward = normalize(forward)
     yrot = quat_normalize(quat_between(np.array([1, 0, 0]), forward))
@@ -197,16 +189,8 @@ def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, trans2joint_list, parents, n_past=
     new_glob_X = quat_mul_vec(quat_inv(yrot), global_x)
 
     # Process object rotation and translation 
-    # new_obj_x = quat_mul_vec(quat_inv(yrot[:, 0, :, :]), obj_x)
+    new_obj_x = quat_mul_vec(quat_inv(yrot[:, 0, :, :]), obj_x)
     new_obj_q = quat_mul(quat_inv(yrot[:, 0, :, :]), obj_q)
 
-    # Apply corresponding rotation to the object translation 
-    obj_trans = obj_x + trans2joint_list[:, np.newaxis, :] # N X T X 3  
-    obj_trans = quat_mul_vec(quat_inv(yrot[:, 0, :, :]), obj_trans) # N X T X 3
-    obj_trans = obj_trans - trans2joint_list[:, np.newaxis, :] # N X T X 3 
-    new_obj_x = obj_trans.copy()  
+    return new_glob_X, new_glob_Q, new_obj_x, new_obj_q
 
-    # back to local quat-pos
-    Q, X = quat_ik(new_glob_Q, new_glob_X, parents)
-
-    return X, Q, new_obj_x, new_obj_q

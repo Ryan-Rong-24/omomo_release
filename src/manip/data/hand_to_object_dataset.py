@@ -6,6 +6,11 @@ import pickle
 import torch
 from torch.utils.data import Dataset
 
+from scipy.spatial.transform import Rotation as R
+
+from src.manip.lafan1.utils import rotate_at_frame_w_obj
+from src.utils.rotation_utils import quaternion_to_matrix_numpy, matrix_to_rotation_6d_numpy, rotation_6d_to_matrix_numpy 
+
 def load_pickle(path):
     """Load and return the object stored in a pickle file."""
     with open(path, "rb") as f:
@@ -139,23 +144,80 @@ class HandToObjectDataset(Dataset):
                 # Create sliding windows
                 for start_idx in range(0, min_len - self.window_size + 1, self.window_size // 2):
                     end_idx = start_idx + self.window_size
-                    
+
+                    left_wrist_pos = left_hand_trimmed[start_idx:end_idx][:, :3]
+                    left_wrist_rot6d = left_hand_trimmed[start_idx:end_idx][:, 3:]
+
+                    left_wrist_rot_mat = rotation_6d_to_matrix_numpy(left_wrist_rot6d)
+                    left_wrist_r = R.from_matrix(left_wrist_rot_mat)
+                    left_wrist_quat = left_wrist_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
+
+                    right_wrist_pos = right_hand_trimmed[start_idx:end_idx][:, :3]
+                    right_wrist_rot6d = right_hand_trimmed[start_idx:end_idx][:, 3:]
+
+                    right_wrist_rot_mat = rotation_6d_to_matrix_numpy(right_wrist_rot6d)
+                    right_wrist_r = R.from_matrix(right_wrist_rot_mat)
+                    right_wrist_quat = right_wrist_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
+
+                    object_pos = object_traj_trimmed[start_idx:end_idx][:, :3]
+                    object_rot6d = object_traj_trimmed[start_idx:end_idx][:, 3:]
+
+                    object_rot_mat = rotation_6d_to_matrix_numpy(object_rot6d)
+                    object_r = R.from_matrix(object_rot_mat)
+                    object_quat = object_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
+
+                    cano_left_wrist_pos, cano_left_wrist_quat, cano_object_pos, cano_object_quat = \
+                        rotate_at_frame_w_obj(left_wrist_pos[np.newaxis, :, np.newaxis, :], left_wrist_quat[np.newaxis, :, np.newaxis, :], \
+                        object_pos[np.newaxis], object_quat[np.newaxis])  
+                    _, _, cano_right_wrist_pos, cano_right_wrist_quat = \
+                        rotate_at_frame_w_obj(left_wrist_pos[np.newaxis, :, np.newaxis, :], left_wrist_quat[np.newaxis, :, np.newaxis, :], \
+                        right_wrist_pos[np.newaxis], right_wrist_quat[np.newaxis])   
+
+                    cano_left_wrist_pos = cano_left_wrist_pos[0, :, 0, :] # T X 3 
+                    cano_left_wrist_quat = cano_left_wrist_quat[0, :, 0, :] # T X 4 
+
+                    cano_object_pos = cano_object_pos[0] # T X 3 
+                    cano_object_quat = cano_object_quat[0] # T X 4 
+
+                    cano_right_wrist_pos = cano_right_wrist_pos[0] # T X 3
+                    cano_right_wrist_quat = cano_right_wrist_quat[0] # T X 4 
+
+                    # Translate everything such that the left_wrist initial position is at the origin. 
+                    left_wrist2origin_trans = cano_left_wrist_pos[0:1, :].copy() 
+                    cano_left_wrist_pos -= left_wrist2origin_trans
+                    cano_right_wrist_pos -= left_wrist2origin_trans 
+                    cano_object_pos -= left_wrist2origin_trans 
+
+                    # Prepare 9D repreesntation for left/right hand, and object 
+                    cano_left_wrist_rot_mat = quaternion_to_matrix_numpy(cano_left_wrist_quat)
+                    cano_left_wrist_rot6d = matrix_to_rotation_6d_numpy(cano_left_wrist_rot_mat)
+
+                    cano_right_wrist_rot_mat = quaternion_to_matrix_numpy(cano_right_wrist_quat)
+                    cano_right_wrist_rot6d = matrix_to_rotation_6d_numpy(cano_right_wrist_rot_mat) 
+
+                    cano_object_rot_mat = quaternion_to_matrix_numpy(cano_object_quat)
+                    cano_object_rot6d = matrix_to_rotation_6d_numpy(cano_object_rot_mat) 
+
+                    cano_left_hand_data = np.concatenate((cano_left_wrist_pos, cano_left_wrist_rot6d), axis=-1) 
+                    cano_right_hand_data = np.concatenate((cano_right_wrist_pos, cano_right_wrist_rot6d), axis=-1) 
+                    cano_object_data = np.concatenate((cano_object_pos, cano_object_rot6d), axis=-1) 
+
                     window_data = {
                         'demo_id': demo_id,
                         'object_id': obj_id,
                         'start_idx': start_idx,
                         'end_idx': end_idx,
-                        'left_hand': left_hand_trimmed[start_idx:end_idx],
-                        'right_hand': right_hand_trimmed[start_idx:end_idx], 
-                        'object': object_traj_trimmed[start_idx:end_idx],
+                        'left_hand': cano_left_hand_data,
+                        'right_hand': cano_right_hand_data, 
+                        'object':cano_object_data,
                     }
                     
                     # Check if this is a motion window
-                    is_motion = self._is_motion_window(object_traj_trimmed[start_idx:end_idx])
+                    is_motion = self._is_motion_window(cano_object_data)
                     window_data['is_motion'] = is_motion
                     
-                    window_data['mean_velocity'] = self._compute_mean_velocity(object_traj_trimmed[start_idx:end_idx])
-                    
+                    window_data['mean_velocity'] = self._compute_mean_velocity(cano_object_data)
+
                     windows.append(window_data)
         
         # Apply sampling strategy
@@ -358,16 +420,15 @@ class HandToObjectDataset(Dataset):
         return len(self.windows)
     
     def __getitem__(self, idx):
+        # For debug (overfitting) 
+        idx = 0 
+
         window = self.windows[idx]
         
         # Convert to tensors
         left_hand = to_tensor(window['left_hand'])  # [T, D]
         right_hand = to_tensor(window['right_hand'])  # [T, D]
         object_traj = to_tensor(window['object'])  # [T, D]
-        
-        # Apply data augmentation during training
-        if self.augment:
-            left_hand, right_hand, object_traj = self._augment_data(left_hand, right_hand, object_traj)
         
         # Normalize
         left_hand_norm = to_tensor(self.normalize_data(left_hand.numpy(), 'left_hand'))
@@ -386,32 +447,6 @@ class HandToObjectDataset(Dataset):
             'is_motion': window['is_motion'],
             'mean_velocity': window['mean_velocity']
         }
-    
-    def _augment_data(self, left_hand, right_hand, object_traj):
-        """Apply data augmentation to improve training stability."""
-        # Small random noise to positions (first 3 dimensions)
-        if np.random.random() < 0.3:  # 30% chance
-            noise_scale = 0.001  # 1mm noise
-            pos_noise = torch.randn_like(left_hand[:, :3]) * noise_scale
-            left_hand[:, :3] += pos_noise
-            right_hand[:, :3] += pos_noise
-            object_traj[:, :3] += pos_noise
-        
-        # Small random scaling to rotations (if using rotation data)
-        if self.pose_dim >= 9 and np.random.random() < 0.2:  # 20% chance
-            scale_factor = 0.95 + 0.1 * torch.rand(1).item()  # Scale between 0.95-1.05
-            if self.use_velocity:
-                # 12D format: pos(3) + vel(3) + rot(6)
-                left_hand[:, 6:12] *= scale_factor
-                right_hand[:, 6:12] *= scale_factor
-                object_traj[:, 6:12] *= scale_factor
-            else:
-                # 9D format: pos(3) + rot(6)
-                left_hand[:, 3:9] *= scale_factor
-                right_hand[:, 3:9] *= scale_factor
-                object_traj[:, 3:9] *= scale_factor
-        
-        return left_hand, right_hand, object_traj
 
 
 # Convenience function for creating datasets

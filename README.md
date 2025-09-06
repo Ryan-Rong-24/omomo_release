@@ -58,7 +58,7 @@ This project implements a **hand-to-object diffusion training pipeline** that:
 #### Basic Training (No Visualization)
 ```bash
 pixi run python main.py \
-  --data_path data/processed_data_with_velocity.pkl \
+  --data_path data/processed_data.pkl \
   --save_dir runs/basic_training \
   --num_steps 5000
 ```
