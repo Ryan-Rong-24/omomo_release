@@ -178,7 +178,6 @@ class CondGaussianDiffusion(nn.Module):
         beta_schedule = 'cosine',
         p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k = 1,
-        batch_size=None,
     ):
         super().__init__()
 
@@ -253,6 +252,20 @@ class CondGaussianDiffusion(nn.Module):
 
         register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
+    def set_metadata(self, stats):
+        mean = stats['object_mean']
+        std = stats['object_std']
+        print('mean', mean.shape, std.shape)
+        self.register_buffer('mean', torch.FloatTensor(mean[None, None]))
+        self.register_buffer('std', torch.FloatTensor(std[None, None]))
+        
+    
+    def normalize_data(self, data):
+        return (data - self.mean) / self.std
+    
+    def denormalize_data(self, data):
+        return data * self.std + self.mean
+    
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
@@ -305,6 +318,12 @@ class CondGaussianDiffusion(nn.Module):
             x = self.p_sample(x, torch.full((b,), i, device=device, dtype=torch.long), x_cond, padding_mask=padding_mask)    
 
         return x # BS X T X D
+
+    @torch.no_grad()
+    def sample_raw(self, x_start, hand_condition, padding_mask=None):
+        motion = self.sample(x_start, hand_condition, padding_mask=padding_mask)
+        motion_raw = self.denormalize_data(motion)
+        return motion_raw, {"motion": motion}
 
     @torch.no_grad()
     def sample(self, x_start, hand_condition, cond_mask=None, padding_mask=None):

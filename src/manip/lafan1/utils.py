@@ -162,7 +162,8 @@ def quat_between(x, y):
 
 def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, n_past=1):
     """
-    Re-orients the animation data according to the last frame of past context.
+    Re-orients the animation data according to the last frame of past context
+    such that the direction is facing forward (x-direction), yaw-only rotation. still be aware of the gravity(z-axis).
 
     :param X: tensor of local positions of shape (Batchsize, Timesteps, Joints, 3)
     :param Q: tensor of local quaternions (Batchsize, Timesteps, Joints, 4)
@@ -178,11 +179,14 @@ def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, n_past=1):
     key_glob_Q = global_q[:, n_past - 1 : n_past, 0:1, :]  # (B, 1, 1, 4)
    
     # The floor is on z = xxx. Project the forward direction to xy plane. 
+    # forward: x direction
+    # Start with global x-axis [1, 0, 0].
+    # Rotate it into key_glob_Q’s orientation.
     forward = np.array([1, 1, 0])[np.newaxis, np.newaxis, np.newaxis, :] * quat_mul_vec(
         key_glob_Q, np.array([1, 0, 0])[np.newaxis, np.newaxis, np.newaxis, :]
     ) # In rest pose, x direction is the body left direction, root joint point to left hip joint.  
    
-
+    # such that the direction is facing forward, yaw-only rotation. still be aware of the 
     forward = normalize(forward)
     yrot = quat_normalize(quat_between(np.array([1, 0, 0]), forward))
     new_glob_Q = quat_mul(quat_inv(yrot), global_q)

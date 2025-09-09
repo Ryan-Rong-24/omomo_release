@@ -76,6 +76,7 @@ class HandToObjectDataset(Dataset):
         
         # Create windows
         self.windows = self._create_windows()
+        print(f"Created {len(self.windows)} windows")
         
         # Apply train/validation split
         self.windows = self._apply_train_val_split()
@@ -90,6 +91,30 @@ class HandToObjectDataset(Dataset):
     def _filter_data(self, single_demo=None, single_object=None):
         """Filter data for overfitting on specific demo/object."""
         filtered_data = {}
+        if self.split == 'mini':
+            seq = 'P0001_624f2ba9'
+            # '194930206998778', 
+            obj_list = ['225397651484143']
+            t0 = 300
+            t1 = t0 + 120
+            filtered_data[seq] = {
+                'left_hand': self.processed_data[seq]['left_hand'],
+                'right_hand': self.processed_data[seq]['right_hand'],
+                "objects": {}
+            }
+            for obj_id in obj_list:
+                filtered_data[seq]['objects'][obj_id] = self.processed_data[seq]['objects'][obj_id]
+            for key, value in filtered_data[seq].items():
+                for k, v in value.items():
+                    if isinstance(v, dict):
+                        for kk, vv in v.items():
+                            filtered_data[seq][key][k][kk] = vv[t0:t1]
+                            print(key, k, kk, filtered_data[seq][key][k][kk].shape)
+                    else:
+                        filtered_data[seq][key][k] = v[t0:t1]
+                        print(key, k, filtered_data[seq][key][k].shape)
+
+            return filtered_data
         
         for demo_id, demo_data in self.processed_data.items():
             if single_demo and demo_id != single_demo:
@@ -165,6 +190,7 @@ class HandToObjectDataset(Dataset):
                     object_rot_mat = rotation_6d_to_matrix_numpy(object_rot6d)
                     object_r = R.from_matrix(object_rot_mat)
                     object_quat = object_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
+
 
                     cano_left_wrist_pos, cano_left_wrist_quat, cano_object_pos, cano_object_quat = \
                         rotate_at_frame_w_obj(left_wrist_pos[np.newaxis, :, np.newaxis, :], left_wrist_quat[np.newaxis, :, np.newaxis, :], \
@@ -287,7 +313,8 @@ class HandToObjectDataset(Dataset):
     
     def _apply_train_val_split(self):
         """Apply train/validation split to windows."""
-        if self.split == 'all':
+
+        if self.split == 'all' or self.split == 'mini':
             return self.windows
             
         # Use seed for reproducible splits
@@ -344,14 +371,25 @@ class HandToObjectDataset(Dataset):
         left_std = np.maximum(left_std, min_std)
         right_std = np.maximum(right_std, min_std)
         object_std = np.maximum(object_std, min_std)
+
+
+        # use minmax for mean and std such that it's land in [-1, 1]
+        object_min, object_max = np.min(all_object_data, axis=0), np.max(all_object_data, axis=0)
+        object_std = (object_max - object_min) / 2.0
+        object_mean = (object_max + object_min) / 2.0
+        
+        all_data = np.concatenate((all_left_data, all_right_data, all_object_data), axis=0)
+        all_min, all_max = np.min(all_data, axis=0), np.max(all_data, axis=0)
+        all_std = (all_max - all_min) / 2.0
+        all_mean = (all_max + all_min) / 2.0
         
         self.stats = {
-            'left_hand_mean': left_mean,
-            'left_hand_std': left_std,
-            'right_hand_mean': right_mean,
-            'right_hand_std': right_std,
-            'object_mean': object_mean,
-            'object_std': object_std,
+            'left_hand_mean': all_mean,
+            'left_hand_std': all_std,
+            'right_hand_mean': all_mean,
+            'right_hand_std': all_std,
+            'object_mean': all_mean,
+            'object_std': all_std,
         }
         
         print("Computed normalization statistics")
@@ -439,6 +477,7 @@ class HandToObjectDataset(Dataset):
         condition = torch.cat([left_hand_norm, right_hand_norm], dim=-1)  # [T, 2*D]
         
         return {
+            'condition_raw': torch.cat([left_hand, right_hand], dim=-1),  # [T, 2*D] - left and right hand trajectories
             'condition': condition,  # [T, 2*D] - left and right hand trajectories
             'target': object_norm,   # [T, D] - object trajectory to denoise
             'target_raw': object_traj,  # [T, D] - unnormalized for evaluation

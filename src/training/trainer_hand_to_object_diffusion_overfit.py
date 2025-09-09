@@ -150,7 +150,7 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10):
             seq_len = torch.tensor([hand_poses.shape[1]]).to(device)  # [1] - actual sequence length
             
             # Prepare input
-            object_motion_init = torch.zeros_like(object_motion_gt).to(device)
+            object_motion_init = torch.randn_like(object_motion_gt).to(device)
             
             # Generate padding mask
             actual_seq_len = seq_len + 1
@@ -158,7 +158,9 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10):
             padding_mask = tmp_mask[:, None, :]
             
             # Sample from model
-            sampled_motion = diffusion_model.sample(object_motion_init, hand_poses, padding_mask=padding_mask)
+            # import pdb; pdb.set_trace()
+            sampled_motion, _= diffusion_model.sample_raw(object_motion_init, hand_poses, padding_mask=padding_mask, )
+            # sampled_motion = diffusion_model.sample(object_motion_init, hand_poses, padding_mask=padding_mask, )
             
             # Compute position errors (only for valid sequence length)
             valid_len = seq_len.item()
@@ -231,7 +233,7 @@ def train_overfit(opt, device):
         single_demo=opt.demo_id, 
         single_object=opt.target_object_id,
         sampling_strategy='random',
-        split='train',
+        split='mini',
         split_seed=42  # Ensure reproducible splits
     )
 
@@ -242,7 +244,7 @@ def train_overfit(opt, device):
         single_demo=opt.demo_id, 
         single_object=opt.target_object_id,
         sampling_strategy='random',
-        split='val',
+        split='mini',
         split_seed=42  # Use same seed for consistent splits
     )
     
@@ -254,7 +256,7 @@ def train_overfit(opt, device):
         single_demo=opt.demo_id, 
         single_object=opt.target_object_id,
         sampling_strategy='random',
-        split='all',  # Use all data
+        split='mini',  # Use all data
         split_seed=42
     )
     print(f"  Successfully loaded dataset from demo {train_dataset.demo_id}, object {train_dataset.target_object_id}")
@@ -277,9 +279,10 @@ def train_overfit(opt, device):
         timesteps=1000,
         loss_type="l1",
         objective="pred_x0",
-        batch_size=1
     )
+    diffusion_model.set_metadata(full_dataset.stats)
    
+
     diffusion_model.to(device)
 
     # Initialize optimizer and scaler
@@ -288,10 +291,11 @@ def train_overfit(opt, device):
 
     # Initialize wandb
     if opt.use_wandb:
+        print(opt, opt.wandb_pj_name, opt.entity, opt.exp_name, opt.save_dir)
         wandb.init(
             config=opt,
             project=opt.wandb_pj_name,
-            entity=opt.entity,
+            # entity=opt.entity,
             name=opt.exp_name,
             dir=opt.save_dir
         )
@@ -341,7 +345,6 @@ def train_overfit(opt, device):
     for epoch in range(total_epochs):
         # Create new permutation at the start of each epoch
         epoch_indices = np.random.permutation(train_dataset_size)
-        print(f"\nStarting epoch {epoch + 1}/{total_epochs}")
         
         for step_in_epoch in range(steps_per_epoch):
             # Calculate global step for logging and checkpoints
@@ -354,14 +357,17 @@ def train_overfit(opt, device):
             sample = train_dataset[sample_idx]
             
             # Extract data from sample and move to device
+            hand_poses_raw = sample['condition_raw'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
+            object_motion_raw = sample['target_raw'].unsqueeze(0).to(device)  # [1, T, D] - unnormalized ground truth
+            left_hand_raw, right_hand_raw = torch.split(hand_poses_raw, train_dataset.pose_dim, dim=-1)
+
+
             hand_poses = sample['condition'].unsqueeze(0).to(device)  # [1, T, 2*D]
             object_motion = sample['target'].unsqueeze(0).to(device)  # [1, T, D] - normalized target
             seq_len = torch.tensor([hand_poses.shape[1]]).to(device)  # [1] - sequence length
             
             # Extract individual hand poses for visualization (split the concatenated condition)
             pose_dim = train_dataset.pose_dim
-            left_hand = hand_poses[:, :, :pose_dim]  # [1, T, D] - first D dimensions
-            right_hand = hand_poses[:, :, pose_dim:]  # [1, T, D] - last D dimensions
             
             # Additional sample info for visualization
             is_moving = sample['is_motion']
@@ -396,23 +402,7 @@ def train_overfit(opt, device):
                     best_eval_error = combined_error
                     best_step = global_step
                     # Save best model state 
-                    best_model_state = {
-                        'model': diffusion_model.state_dict().copy(),
-                        'optimizer': optimizer.state_dict().copy(),
-                        'scaler': scaler.state_dict().copy(),
-                        'step': global_step,
-                        'loss': loss.item(),
-                        'eval_results': eval_results
-                    }
-                    print(f"  New best model at step {global_step} with combined error {combined_error:.4f} (previous: {best_eval_error:.4f})")
-                    
-                    # Visualize best model prediction
-                    if visualizer:
-                        visualizer.log_best_model_prediction(
-                            global_step, left_hand, right_hand, object_motion, 
-                            diffusion_model, device, seq_len, is_moving, mean_velocity
-                        )
-                
+
                 if opt.use_wandb:
                     wandb.log({
                         "eval/mean_position_error": eval_results['mean_position_error'],
@@ -439,7 +429,7 @@ def train_overfit(opt, device):
                 }
                 torch.save(checkpoint, os.path.join(wdir, f'model-{global_step}.pt'))
 
-            if step_in_epoch == 0 or step_in_epoch == steps_per_epoch // 2:
+            if global_step % 100 == 0:  
                 epoch_progress = f"Epoch {epoch + 1}/{total_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}"
                 print(f"Step {global_step} ({epoch_progress}), Loss: {loss.item():.6f}, Best eval error: {best_eval_error:.4f}m (step {best_step})")
                 
@@ -453,8 +443,10 @@ def train_overfit(opt, device):
 
             # Visualize training frame (with configurable frequency)
             if global_step % opt.visualization_frequency == 0 and visualizer:
+                object_pred_raw, _ = diffusion_model.sample_raw(torch.randn_like(object_motion), hand_poses, padding_mask=padding_mask)
                 visualizer.log_training_step(
-                    global_step, left_hand, right_hand, object_motion,
+                    global_step,  left_hand_raw, right_hand_raw, object_motion_raw, 
+                    object_pred=object_pred_raw,
                     seq_len=seq_len, 
                     is_moving=is_moving, 
                     mean_velocity=mean_velocity
@@ -464,61 +456,6 @@ def train_overfit(opt, device):
     print(f"Total epochs completed: {total_epochs}")
     print(f"Best model: step {best_step} with eval error {best_eval_error:.4f}m")
 
-    # Save best model
-    if best_model_state is not None:
-        best_model_state['dataset_info'] = {
-            'demo_id': train_dataset.demo_id,
-            'object_id': train_dataset.target_object_id,
-            'window_size': opt.window_size,
-            'full_length': train_dataset.full_length
-        }
-        best_model_path = os.path.join(wdir, 'best_model.pt')
-        torch.save(best_model_state, best_model_path)
-        print(f"Saved best model to {best_model_path}")
-
-        # Load best model for inference
-        print(f"Loading best model (step {best_step}, eval error {best_eval_error:.4f}m) for inference...")
-        diffusion_model.load_state_dict(best_model_state['model'])
-        
-        # Final comprehensive evaluation on full dataset (train + val)
-        print(f"\nFinal evaluation on best model (full dataset)...")
-        final_results = evaluate_model(diffusion_model, full_dataset, device, num_eval_windows=len(full_dataset.windows))
-        print(f"Final evaluation results:")
-        print(f"  Mean position error: {final_results['mean_position_error']:.4f} meters")
-        print(f"  Max position error: {final_results['max_position_error']:.4f} meters")
-        print(f"  Mean rotation error: {final_results['mean_rotation_error']:.4f}")
-        print(f"  Mean combined error: {final_results['mean_combined_error']:.4f}")
-        print(f"  Evaluated on {len(full_dataset.windows)} windows (train + val)")
-        
-        # Visualize best model evaluation (simplified for overfit training)
-        if visualizer:
-            print("  Visualizing evaluation samples...")
-            for i in range(min(3, len(full_dataset.windows))):
-                sample = full_dataset[i]
-                condition = sample['condition'].unsqueeze(0).to(device)
-                object_gt = sample['target_raw'].unsqueeze(0).to(device)
-                
-                # Split hands
-                D = full_dataset.pose_dim
-                left_hand = condition[:, :, :D]
-                right_hand = condition[:, :, D:]
-                
-                visualizer.log_best_model_prediction(
-                    f"eval_{i}", left_hand, right_hand, object_gt,
-                    diffusion_model, device,
-                    seq_len=torch.tensor([condition.shape[1]]).to(device),
-                    is_moving=sample['is_motion'],
-                    mean_velocity=sample['mean_velocity']
-                )
-    else:
-        print("No best model found, using final model for inference")
-        final_results = evaluate_model(diffusion_model, full_dataset, device, num_eval_windows=len(full_dataset.windows))
-        print(f"Final model evaluation (full dataset):")
-        print(f"  Mean position error: {final_results['mean_position_error']:.4f} meters")
-        print(f"  Max position error: {final_results['max_position_error']:.4f} meters")
-        print(f"  Mean rotation error: {final_results['mean_rotation_error']:.4f}")
-        print(f"  Mean combined error: {final_results['mean_combined_error']:.4f}")
-        print(f"  Evaluated on {len(full_dataset.windows)} windows (train + val)")
 
     # Test sampling - generate full trajectory using sliding windows
     print("\nTesting sampling on full trajectory...")

@@ -166,59 +166,59 @@ class RerunVisualizer:
         if not self.enable_visualization:
             return
         
-        try:
-            # Handle both integer and string step values
-            if isinstance(step, str):
-                # Extract numeric part from strings like "best_1000" or "eval_5"
-                import re
-                numeric_part = re.findall(r'\d+', step)
-                step_num = int(numeric_part[0]) if numeric_part else 0
-            else:
-                step_num = step
+        # try:
+        # Handle both integer and string step values
+        if isinstance(step, str):
+            # Extract numeric part from strings like "best_1000" or "eval_5"
+            import re
+            numeric_part = re.findall(r'\d+', step)
+            step_num = int(numeric_part[0]) if numeric_part else 0
+        else:
+            step_num = step
+        
+        # rr.set_time("training_step", sequence=step_num)
+        rr.set_time_sequence("training_step", step_num)
+        
+        # Extract positions
+        left_pos = left_hand[0, :, :3].cpu().numpy()  # [T, 3]
+        right_pos = right_hand[0, :, :3].cpu().numpy()
+        object_pos_gt = object_gt[0, :, :3].cpu().numpy()
+        
+        # Apply valid length
+        valid_len = seq_len.item() if seq_len is not None else len(left_pos)
+        valid_len = min(valid_len, len(left_pos), len(right_pos), len(object_pos_gt))
+        
+        left_pos = left_pos[:valid_len]
+        right_pos = right_pos[:valid_len]
+        object_pos_gt = object_pos_gt[:valid_len]
+        
+        # Log trajectories
+        rr.log("training/left_hand_traj", rr.LineStrips3D([left_pos], colors=[[0, 255, 0]], radii=[0.01]))
+        rr.log("training/right_hand_traj", rr.LineStrips3D([right_pos], colors=[[0, 0, 255]], radii=[0.01]))
+        rr.log("training/object_gt_traj", rr.LineStrips3D([object_pos_gt], colors=[[255, 0, 0]], radii=[0.015]))
+        
+        # Log prediction if available
+        if object_pred is not None:
+            object_pos_pred = object_pred[0, :valid_len, :3].cpu().numpy()
+            rr.log("training/object_pred_traj", rr.LineStrips3D([object_pos_pred], colors=[[255, 165, 0]], radii=[0.015]))
+        
+        # Log MANO hands at current position
+        if valid_len > 0 and self.left_mano is not None:
+            self._log_mano_hands(left_pos[-1], right_pos[-1])
+        
+        # Log metadata
+        metadata = f"Step: {step}"
+        if seq_len is not None:
+            metadata += f", Seq: {seq_len.item()}"
+        if is_moving is not None:
+            metadata += f", Moving: {is_moving}"
+        if mean_velocity is not None:
+            metadata += f", Vel: {mean_velocity:.4f}"
+        rr.log("training/info", rr.TextDocument(metadata))
             
-            rr.set_time("training_step", sequence=step_num)
-            
-            # Extract positions
-            left_pos = left_hand[0, :, :3].cpu().numpy()  # [T, 3]
-            right_pos = right_hand[0, :, :3].cpu().numpy()
-            object_pos_gt = object_gt[0, :, :3].cpu().numpy()
-            
-            # Apply valid length
-            valid_len = seq_len.item() if seq_len is not None else len(left_pos)
-            valid_len = min(valid_len, len(left_pos), len(right_pos), len(object_pos_gt))
-            
-            left_pos = left_pos[:valid_len]
-            right_pos = right_pos[:valid_len]
-            object_pos_gt = object_pos_gt[:valid_len]
-            
-            # Log trajectories
-            rr.log("training/left_hand_traj", rr.LineStrips3D([left_pos], colors=[[0, 255, 0]], radii=[0.01]))
-            rr.log("training/right_hand_traj", rr.LineStrips3D([right_pos], colors=[[0, 0, 255]], radii=[0.01]))
-            rr.log("training/object_gt_traj", rr.LineStrips3D([object_pos_gt], colors=[[255, 0, 0]], radii=[0.015]))
-            
-            # Log prediction if available
-            if object_pred is not None:
-                object_pos_pred = object_pred[0, :valid_len, :3].cpu().numpy()
-                rr.log("training/object_pred_traj", rr.LineStrips3D([object_pos_pred], colors=[[255, 165, 0]], radii=[0.015]))
-            
-            # Log MANO hands at current position
-            if valid_len > 0 and self.left_mano is not None:
-                self._log_mano_hands(left_pos[-1], right_pos[-1])
-            
-            # Log metadata
-            metadata = f"Step: {step}"
-            if seq_len is not None:
-                metadata += f", Seq: {seq_len.item()}"
-            if is_moving is not None:
-                metadata += f", Moving: {is_moving}"
-            if mean_velocity is not None:
-                metadata += f", Vel: {mean_velocity:.4f}"
-            rr.log("training/info", rr.TextDocument(metadata))
-            
-            # Note: We're recording continuously to training_session.rrd, no need for periodic saves
-                
-        except Exception as e:
-            print(f"⚠️ Training step logging failed: {e}")
+        # Note: We're recording continuously to training_session.rrd, no need for periodic saves
+        # except Exception as e:
+        #     print(f"⚠️ Training step logging failed: {e}")
     
     def _log_mano_hands(self, left_pos, right_pos):
         """Log MANO hand meshes at positions"""
@@ -249,33 +249,11 @@ class RerunVisualizer:
         """Generate and log best model prediction"""
         if not self.enable_visualization:
             return
+    
+        # Log with prediction
+        self.log_training_step(f"best_{step}", left_hand, right_hand, object_gt, 
+                                object_pred, seq_len, is_moving, mean_velocity)
         
-        try:
-            # Generate prediction
-            diffusion_model.eval()
-            with torch.no_grad():
-                hand_poses = torch.cat([left_hand, right_hand], dim=-1)
-                object_init = torch.zeros_like(left_hand)
-                
-                # Simple padding mask
-                if seq_len is not None:
-                    actual_seq_len = seq_len + 1
-                    window_size = hand_poses.shape[1]
-                    tmp_mask = torch.arange(window_size + 1, device=device).expand(1, window_size + 1) < actual_seq_len[:, None]
-                    padding_mask = tmp_mask[:, None, :]
-                else:
-                    padding_mask = None
-                
-                object_pred = diffusion_model.sample(object_init, hand_poses, padding_mask=padding_mask)
-            
-            diffusion_model.train()
-            
-            # Log with prediction
-            self.log_training_step(f"best_{step}", left_hand, right_hand, object_gt, 
-                                 object_pred, seq_len, is_moving, mean_velocity)
-            
-        except Exception as e:
-            print(f"⚠️ Best model prediction failed: {e}")
     
     def log_final_trajectory(self, dataset, sampled_trajectory):
         """Log final trajectory comparison with object mesh"""
@@ -283,7 +261,7 @@ class RerunVisualizer:
             return
         
         try:
-            rr.set_time("final", sequence=0)
+            rr.set_time_sequence("final", 0)
             
             # Get trajectory data
             left_traj = dataset.left_hand_full[:, :3].numpy()
