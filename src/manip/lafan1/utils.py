@@ -1,5 +1,8 @@
+
 import numpy as np
 import torch 
+# from scipy.spatial.transform import Rotation as R
+from src.utils.quaternion import quaternion_to_matrix
 from src.utils.rotation_utils import transforms
 
 def length(x, axis=-1, keepdims=True):
@@ -196,5 +199,10 @@ def rotate_at_frame_w_obj(X, Q, obj_x, obj_q, n_past=1):
     new_obj_x = quat_mul_vec(quat_inv(yrot[:, 0, :, :]), obj_x)
     new_obj_q = quat_mul(quat_inv(yrot[:, 0, :, :]), obj_q)
 
-    return new_glob_X, new_glob_Q, new_obj_x, new_obj_q
+    # print(quat_inv(yrot).shape, type(quat_inv(yrot)))
+    # quat in this files is in wxyz format
+    # scipy R assumes quaternion is in xyzw format
+    # canoTw_rot = R.from_quat(quat_inv(yrot)[..., [1, 2, 3, 0]]).as_matrix()
+    canoTw_rot = quaternion_to_matrix(torch.FloatTensor(quat_inv(yrot))).numpy()
+    return new_glob_X, new_glob_Q, new_obj_x, new_obj_q, canoTw_rot
 

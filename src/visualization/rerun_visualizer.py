@@ -161,7 +161,7 @@ class RerunVisualizer:
         return transform_matrix @ position
     
     def log_training_step(self, step, left_hand, right_hand, object_gt, 
-                         object_pred=None, seq_len=None, is_moving=None, mean_velocity=None):
+                         object_pred=None, object_noisy=None, seq_len=None, is_moving=None, mean_velocity=None):
         """Log training step with trajectories and MANO hands"""
         if not self.enable_visualization:
             return
@@ -179,9 +179,15 @@ class RerunVisualizer:
         # rr.set_time("training_step", sequence=step_num)
         rr.set_time_sequence("training_step", step_num)
         
-        # Extract positions
-        left_pos = left_hand[0, :, :3].cpu().numpy()  # [T, 3]
-        right_pos = right_hand[0, :, :3].cpu().numpy()
+        # Extract positions  
+        if left_hand.shape[-1] == 21*3:
+            left_hand = left_hand.reshape(1, -1, 21, 3)
+            right_hand = right_hand.reshape(1, -1, 21, 3)
+        
+
+
+        left_pos = left_hand[0, :, 0, :3].cpu().numpy()  # [T, 3]
+        right_pos = right_hand[0, :, 0, :3].cpu().numpy()
         object_pos_gt = object_gt[0, :, :3].cpu().numpy()
         
         # Apply valid length
@@ -197,10 +203,19 @@ class RerunVisualizer:
         rr.log("training/right_hand_traj", rr.LineStrips3D([right_pos], colors=[[0, 0, 255]], radii=[0.01]))
         rr.log("training/object_gt_traj", rr.LineStrips3D([object_pos_gt], colors=[[255, 0, 0]], radii=[0.015]))
         
+        # Log hand pose as point cloud [B=0, T=0/-1, J=21, 3] the the start and last frame
+        print('left hand shape: ', left_hand.shape, left_hand[0, 0, :, :3].cpu().numpy())
+        for t in [0, -1]:
+            rr.log(f"training/left_hand_pose/frame_{t}", rr.Points3D(left_hand[0, t, :, :3].cpu().numpy(), colors=[[0, 255, 0]], radii=[0.01]))
+            rr.log(f"training/right_hand_pose/frame_{t}", rr.Points3D(right_hand[0, t, :, :3].cpu().numpy(), colors=[[0, 0, 255]], radii=[0.01]))
+
         # Log prediction if available
         if object_pred is not None:
             object_pos_pred = object_pred[0, :valid_len, :3].cpu().numpy()
             rr.log("training/object_pred_traj", rr.LineStrips3D([object_pos_pred], colors=[[255, 165, 0]], radii=[0.015]))
+        if object_noisy is not None:
+            object_pos_noisy = object_noisy[0, :valid_len, :3].cpu().numpy()
+            rr.log("training/object_noisy_traj", rr.LineStrips3D([object_pos_noisy], colors=[[255, 0, 255]], radii=[0.015]))
         
         # Log MANO hands at current position
         if valid_len > 0 and self.left_mano is not None:

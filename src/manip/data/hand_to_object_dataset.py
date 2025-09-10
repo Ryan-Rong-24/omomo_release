@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import os
@@ -5,11 +6,12 @@ import numpy as np
 import pickle
 import torch
 from torch.utils.data import Dataset
-
+import smplx
 from scipy.spatial.transform import Rotation as R
 
 from src.manip.lafan1.utils import rotate_at_frame_w_obj
 from src.utils.rotation_utils import quaternion_to_matrix_numpy, matrix_to_rotation_6d_numpy, rotation_6d_to_matrix_numpy 
+from src.utils.motion_repr import cano_seq_mano
 import os.path as osp
 def load_pickle(path):
     """Load and return the object stored in a pickle file."""
@@ -99,6 +101,12 @@ class HandToObjectDataset(Dataset):
         self.val_split_ratio = val_split_ratio
         self.split_seed = split_seed
         
+        self.mano_model_path = '/move/u/yufeiy2/pretrain/body_models/mano_v1_2/models'
+        self.sided_mano_models = {
+            'left': smplx.create(os.path.join(self.mano_model_path, 'MANO_LEFT.pkl'), 'mano', is_rhand=False, num_pca_comps=15),
+            'right': smplx.create(os.path.join(self.mano_model_path, 'MANO_RIGHT.pkl'), 'mano', is_rhand=True, num_pca_comps=15),
+        }
+
         # Load processed data
         print(f"Loading data from {data_path}...")
         self.processed_data = load_pickle(data_path)
@@ -125,9 +133,11 @@ class HandToObjectDataset(Dataset):
         # Setup full trajectory data for the current split
         self._setup_full_trajectory_data_from_windows()
 
+
+
         self.noise_std_params_dict = {'global_orient': noise_std_mano_global_rot,
                                       'transl': noise_std_mano_trans,
-                                      'body_pose': noise_std_mano_body_rot,
+                                      'hand_pose': noise_std_mano_body_rot,
                                       'betas': noise_std_mano_betas,
                                       'object_rot': noise_std_obj_rot,
                                       'object_trans': noise_std_obj_trans,
@@ -199,8 +209,8 @@ class HandToObjectDataset(Dataset):
                 camera_traj = demo_data['wTc']  # (T, 4, 4)
                     
                 # Find the overlapping time range for all trajectories
-                left_hand = demo_data['left_hand']['theta'][..., :3+3]
-                right_hand = demo_data['right_hand']['theta'][..., :3+3]
+                left_hand = demo_data['left_hand']['theta']
+                right_hand = demo_data['right_hand']['theta']
                 min_len = min(len(left_hand), len(right_hand), len(object_traj))
                 
                 if min_len < self.window_size:
@@ -217,14 +227,14 @@ class HandToObjectDataset(Dataset):
                 for start_idx in range(0, min_len - self.window_size + 1, self.window_size // 2):
                     end_idx = start_idx + self.window_size
 
-                    left_wrist_pos = left_hand_trimmed[start_idx:end_idx][:, 3:]
                     left_wrist_aa = left_hand_trimmed[start_idx:end_idx][:, 0:3]
+                    left_wrist_pos = left_hand_trimmed[start_idx:end_idx][:, 3:6]
 
                     left_wrist_r = R.from_rotvec(left_wrist_aa)
                     left_wrist_quat = left_wrist_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
 
-                    right_wrist_pos = right_hand_trimmed[start_idx:end_idx][:, 3:]
-                    right_wrist_aa = right_hand_trimmed[start_idx:end_idx][:, :3]
+                    right_wrist_aa = right_hand_trimmed[start_idx:end_idx][:, 0:3]
+                    right_wrist_pos = right_hand_trimmed[start_idx:end_idx][:, 3:6]
 
                     right_wrist_r = R.from_rotvec(right_wrist_aa)
                     right_wrist_quat = right_wrist_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
@@ -239,16 +249,17 @@ class HandToObjectDataset(Dataset):
                     camera_r = R.from_matrix(camera_rot_mat)
                     camera_quat = camera_r.as_quat()[:, [3, 0, 1, 2]]  # Returns [x, y, z, w] -> wxyz 
 
+                    # ######### 1. Canonicalize the data using the camera frame  ##########
                     # put them to 1st camera frame
-                    cano_camera_pos, cano_camera_quat, cano_object_pos, cano_object_quat = \
+                    cano_camera_pos, cano_camera_quat, cano_object_pos, cano_object_quat, canoTw_rot = \
                         rotate_at_frame_w_obj(camera_pos[np.newaxis, :, np.newaxis, :], camera_quat[np.newaxis, :, np.newaxis, :], \
                         object_pos[np.newaxis], object_quat[np.newaxis])  
 
-                    _, _, cano_left_wrist_pos, cano_left_wrist_quat = \
+                    _, _, cano_left_wrist_pos, cano_left_wrist_quat, _ = \
                         rotate_at_frame_w_obj(camera_pos[np.newaxis, :, np.newaxis, :], camera_quat[np.newaxis, :, np.newaxis, :], \
                         left_wrist_pos[np.newaxis], left_wrist_quat[np.newaxis])   
 
-                    _, _, cano_right_wrist_pos, cano_right_wrist_quat = \
+                    _, _, cano_right_wrist_pos, cano_right_wrist_quat, _ = \
                         rotate_at_frame_w_obj(camera_pos[np.newaxis, :, np.newaxis, :], camera_quat[np.newaxis, :, np.newaxis, :], \
                         right_wrist_pos[np.newaxis], right_wrist_quat[np.newaxis])   
                 
@@ -273,11 +284,39 @@ class HandToObjectDataset(Dataset):
 
                     # Translate everything such that the camear initial position is at the origin. 
                     camera2origin_trans = cano_camera_pos[0:1, :].copy() 
+                    canoTw = np.eye(4)
+                    canoTw[:3, :3] = canoTw_rot
+                    canoTw[:3, 3] = -camera2origin_trans
+
                     cano_camera_pos -= camera2origin_trans
                     cano_left_wrist_pos -= camera2origin_trans
                     cano_right_wrist_pos -= camera2origin_trans
                     cano_object_pos -= camera2origin_trans
                     
+                    print(left_hand_trimmed[start_idx:end_idx].shape)
+                    mano_params_dict = {'global_orient': left_wrist_aa,
+                                 'transl': left_wrist_pos,
+                                 'betas': demo_data['left_hand']['shape'][start_idx:end_idx],
+                                 'hand_pose': left_hand_trimmed[start_idx:end_idx][:, 6:],
+                                 } 
+                                 
+                    cano_left_positions, cano_left_mano_params_dict = cano_seq_mano(
+                        canoTw=canoTw, 
+                        positions=None,
+                        mano_params_dict=mano_params_dict,
+                        mano_model=self.sided_mano_models['left'], device='cpu')
+
+                    mano_params_dict = {'global_orient': right_wrist_aa,
+                                 'transl': right_wrist_pos,
+                                 'betas': demo_data['right_hand']['shape'][start_idx:end_idx],
+                                 'hand_pose': right_hand_trimmed[start_idx:end_idx][:, 6:],
+                                 } 
+                                 
+                    cano_right_positions, cano_right_mano_params_dict = cano_seq_mano(
+                        canoTw=canoTw, 
+                        positions=None,
+                        mano_params_dict=mano_params_dict,
+                        mano_model=self.sided_mano_models['right'], device='cpu')
 
                     # Prepare 9D repreesntation for left/right hand, and object 
                     cano_left_wrist_rot_mat = quaternion_to_matrix_numpy(cano_left_wrist_quat)
@@ -304,10 +343,20 @@ class HandToObjectDataset(Dataset):
                         'start_idx': start_idx,
                         'end_idx': end_idx,
 
-                        'left_hand': cano_left_hand_data,
-                        'right_hand': cano_right_hand_data, 
+                        # 'left_hand': cano_left_hand_data,
+                        # 'right_hand': cano_right_hand_data, 
                         'object':cano_object_data,
                         'camera':cano_camera_data,
+
+
+                        'left_hand': cano_left_positions.reshape(-1, 21*3),
+                        'right_hand': cano_right_positions.reshape(-1, 21*3),
+
+                        'left_hand_params': cano_left_mano_params_dict,
+                        'right_hand_params': cano_right_mano_params_dict,
+
+                        'left_hand_joints': cano_left_positions,
+                        'right_hand_joints': cano_right_positions,
 
                         # 'wTc': 
                         # 'wTo': 
@@ -459,20 +508,36 @@ class HandToObjectDataset(Dataset):
         object_std = (object_max - object_min) / 2.0
         object_mean = (object_max + object_min) / 2.0
         
-        all_data = np.concatenate((all_left_data, all_right_data, all_object_data), axis=0)
-        all_min, all_max = np.min(all_data, axis=0), np.max(all_data, axis=0)
-        all_std = (all_max - all_min) / 2.0
-        all_mean = (all_max + all_min) / 2.0
+        if all_left_data.shape[-1] != all_object_data.shape[-1]:
+            all_data = np.concatenate((all_left_data, all_right_data), axis=0)
+            all_min, all_max = np.min(all_data, axis=0), np.max(all_data, axis=0)
+            all_std = (all_max - all_min) / 2.0
+            all_mean = (all_max + all_min) / 2.0
+
+            self.stats = {
+                'left_hand_mean': all_mean,
+                'left_hand_std': all_std,
+                'right_hand_mean': all_mean,
+                'right_hand_std': all_std,
+                'object_mean': object_mean,
+                'object_std': object_std,
+            }
         
-        self.stats = {
-            'left_hand_mean': all_mean,
-            'left_hand_std': all_std,
-            'right_hand_mean': all_mean,
-            'right_hand_std': all_std,
-            'object_mean': all_mean,
-            'object_std': all_std,
-        }
-        
+        else:
+            all_data = np.concatenate((all_left_data, all_right_data, all_object_data), axis=0)
+            all_min, all_max = np.min(all_data, axis=0), np.max(all_data, axis=0)
+            all_std = (all_max - all_min) / 2.0
+            all_mean = (all_max + all_min) / 2.0
+            
+            self.stats = {
+                'left_hand_mean': all_mean,
+                'left_hand_std': all_std,
+                'right_hand_mean': all_mean,
+                'right_hand_std': all_std,
+                'object_mean': all_mean,
+                'object_std': all_std,
+            }
+            
         print("Computed normalization statistics")
         print(f"Object trajectory - Mean range: [{object_mean.min():.3f}, {object_mean.max():.3f}]")
         print(f"Object trajectory - Std range: [{object_std.min():.3f}, {object_std.max():.3f}]")
@@ -543,11 +608,16 @@ class HandToObjectDataset(Dataset):
         idx = 0 
 
         window = self.windows[idx]
-
+        
+        ######### 2. add synthetic noise / use off-the-shelf noise to the data ##########
         # get noisy data
         window_noisy = self.add_noise_data(window)
         
-        # Convert to tensors
+
+        ######### 3. create motion repr ##########
+
+
+        ######### 4. Convert to tensors ##########
         left_hand = to_tensor(window['left_hand'])  # [T, D]
         right_hand = to_tensor(window['right_hand'])  # [T, D]
         object_traj = to_tensor(window['object'])  # [T, D]
@@ -583,7 +653,7 @@ class HandToObjectDataset(Dataset):
         ######################################## add noise to  params
 
         can_window_dict_noisy = {}
-        for param_name in ['left_hand', 'right_hand', 'object',]:
+        for param_name in [ 'object',]:
             param = can_window_dict[param_name]  # [T, D]
             transl, rot6d = param[:, :3], param[:, 3:]
 

@@ -264,7 +264,7 @@ def train_overfit(opt, device):
 
     # Define model - use window size for model architecture
     repr_dim = train_dataset.pose_dim  # Output dimension (3D translation + 6D rotation)
-    cond_dim = train_dataset.pose_dim * 3  # Input dimension (2 hands × pose_dim each)
+    cond_dim = 2*21 * 3+9  # Input dimension (2 hands × pose_dim each)
    
     diffusion_model = CondGaussianDiffusion(
         opt,
@@ -456,12 +456,13 @@ def train_overfit(opt, device):
             if global_step % opt.visualization_frequency == 0 and visualizer:
                 hand_poses_raw = sample['hand_raw'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
                 object_motion_raw = sample['target_raw'].unsqueeze(0).to(device)  # [1, T, D] - unnormalized ground truth
-                left_hand_raw, right_hand_raw = torch.split(hand_poses_raw, train_dataset.pose_dim, dim=-1)
+                left_hand_raw, right_hand_raw = torch.split(hand_poses_raw, 21*3, dim=-1)
 
 
                 object_pred_raw, _ = diffusion_model.sample_raw(torch.randn_like(object_motion), cond, padding_mask=padding_mask)
                 visualizer.log_training_step(
-                    global_step,  left_hand_raw, right_hand_raw, object_motion_raw, 
+                    global_step,  left_hand_raw, right_hand_raw, object_motion_raw,
+                    object_noisy=sample['target_noisy_raw'], 
                     object_pred=object_pred_raw,
                     seq_len=seq_len, 
                     is_moving=is_moving, 
