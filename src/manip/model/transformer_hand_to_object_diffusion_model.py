@@ -165,6 +165,7 @@ class CondGaussianDiffusion(nn.Module):
         self,
         opt,
         d_feats,
+        condition_dim,
         d_model,
         n_head,
         n_dec_layers,
@@ -184,10 +185,11 @@ class CondGaussianDiffusion(nn.Module):
         # For hand-to-object task:
         # d_feats = output object trajectory dimension (9 or 12)
         # condition_dim = input hand poses dimension (2 * d_feats for left + right hand)
-        condition_dim = 2 * d_feats  # Left hand + Right hand
+        # condition_dim = 3 * d_feats  # Left hand + Right hand
         d_input_feats = d_feats + condition_dim  # Object trajectory + hand poses
             
         self.denoise_fn = TransformerDiffusionModel(
+            # condition_dim=condition_dim,
             d_input_feats=d_input_feats, 
             d_feats=d_feats, 
             d_model=d_model, 

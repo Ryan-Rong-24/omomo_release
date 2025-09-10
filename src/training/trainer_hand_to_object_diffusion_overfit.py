@@ -145,9 +145,9 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10):
             sample = val_dataset[i]
             
             # Extract data from sample
-            hand_poses = sample['condition'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
+            cond = sample['condition'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
             object_motion_gt = sample['target_raw'].unsqueeze(0).to(device)  # [1, T, D] - unnormalized ground truth
-            seq_len = torch.tensor([hand_poses.shape[1]]).to(device)  # [1] - actual sequence length
+            seq_len = torch.tensor([cond.shape[1]]).to(device)  # [1] - actual sequence length
             
             # Prepare input
             object_motion_init = torch.randn_like(object_motion_gt).to(device)
@@ -159,7 +159,7 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10):
             
             # Sample from model
             # import pdb; pdb.set_trace()
-            sampled_motion, _= diffusion_model.sample_raw(object_motion_init, hand_poses, padding_mask=padding_mask, )
+            sampled_motion, _= diffusion_model.sample_raw(object_motion_init, cond, padding_mask=padding_mask, )
             # sampled_motion = diffusion_model.sample(object_motion_init, hand_poses, padding_mask=padding_mask, )
             
             # Compute position errors (only for valid sequence length)
@@ -264,11 +264,12 @@ def train_overfit(opt, device):
 
     # Define model - use window size for model architecture
     repr_dim = train_dataset.pose_dim  # Output dimension (3D translation + 6D rotation)
-    input_dim = train_dataset.pose_dim * 2  # Input dimension (2 hands × pose_dim each)
+    cond_dim = train_dataset.pose_dim * 3  # Input dimension (2 hands × pose_dim each)
    
     diffusion_model = CondGaussianDiffusion(
         opt,
         d_feats=repr_dim,
+        condition_dim=cond_dim,
         d_model=opt.d_model,
         n_head=opt.n_head,
         n_dec_layers=opt.n_dec_layers,
@@ -355,19 +356,29 @@ def train_overfit(opt, device):
             # Get sample for this step
             sample_idx = epoch_indices[step_in_epoch]
             sample = train_dataset[sample_idx]
+
+            cond = sample['condition'].unsqueeze(0).to(device)  # [1, T, 2*D]
+            object_motion = sample['target'].unsqueeze(0).to(device)  # [1, T, D] - normalized target
+            seq_len = torch.tensor([cond.shape[1]]).to(device)  # [1] - sequence length
+
+            ######### add occlusion mask for traj repr, with some schedules
+            mask_prob = 0.5
+            max_infill_ratio = 0.1
+            prob = random.uniform(0, 1)
+            if prob > 1 - mask_prob:
+                batch_size, clip_len, _ = cond.shape
+                traj_feat_dim = sample['traj_noisy_raw'].shape[-1]
+                start = torch.FloatTensor(batch_size).uniform_(0, clip_len-1).long()
+                mask_len = (clip_len * torch.FloatTensor(batch_size).uniform_(0, 1) * max_infill_ratio).long()
+                end = start + mask_len
+                end[end>clip_len] = clip_len
+                mask_traj = torch.ones(batch_size, clip_len).to(device)  # [bs, t]
+                for bs in range(batch_size):
+                    mask_traj[bs, start[bs]:end[bs]] = 0
+                mask_traj = mask_traj.unsqueeze(-1).repeat(1, 1, traj_feat_dim)   # [bs, t, 4]
+                cond[:, :, -traj_feat_dim:] = cond[:, :, -traj_feat_dim:] * mask_traj
             
             # Extract data from sample and move to device
-            hand_poses_raw = sample['condition_raw'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
-            object_motion_raw = sample['target_raw'].unsqueeze(0).to(device)  # [1, T, D] - unnormalized ground truth
-            left_hand_raw, right_hand_raw = torch.split(hand_poses_raw, train_dataset.pose_dim, dim=-1)
-
-
-            hand_poses = sample['condition'].unsqueeze(0).to(device)  # [1, T, 2*D]
-            object_motion = sample['target'].unsqueeze(0).to(device)  # [1, T, D] - normalized target
-            seq_len = torch.tensor([hand_poses.shape[1]]).to(device)  # [1] - sequence length
-            
-            # Extract individual hand poses for visualization (split the concatenated condition)
-            pose_dim = train_dataset.pose_dim
             
             # Additional sample info for visualization
             is_moving = sample['is_motion']
@@ -379,7 +390,7 @@ def train_overfit(opt, device):
             padding_mask = tmp_mask[:, None, :]
 
             with autocast(enabled=True):
-                loss = diffusion_model(object_motion, hand_poses, padding_mask=padding_mask)
+                loss = diffusion_model(object_motion, cond, padding_mask=padding_mask)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -443,7 +454,12 @@ def train_overfit(opt, device):
 
             # Visualize training frame (with configurable frequency)
             if global_step % opt.visualization_frequency == 0 and visualizer:
-                object_pred_raw, _ = diffusion_model.sample_raw(torch.randn_like(object_motion), hand_poses, padding_mask=padding_mask)
+                hand_poses_raw = sample['hand_raw'].unsqueeze(0).to(device)  # [1, T, 2*D] - left + right hand
+                object_motion_raw = sample['target_raw'].unsqueeze(0).to(device)  # [1, T, D] - unnormalized ground truth
+                left_hand_raw, right_hand_raw = torch.split(hand_poses_raw, train_dataset.pose_dim, dim=-1)
+
+
+                object_pred_raw, _ = diffusion_model.sample_raw(torch.randn_like(object_motion), cond, padding_mask=padding_mask)
                 visualizer.log_training_step(
                     global_step,  left_hand_raw, right_hand_raw, object_motion_raw, 
                     object_pred=object_pred_raw,
@@ -537,7 +553,7 @@ def parse_opt():
     parser = argparse.ArgumentParser()
     
     # Data parameters
-    parser.add_argument('--data_path', type=str, default='data/processed_data.pkl', help='Path to processed data pickle file')
+    parser.add_argument('--data_path', type=str, default='/move/u/yufeiy2/data/HOT3D/pred_pose/mini_P0001_624f2ba9.npz', help='Path to processed data pickle file')
     parser.add_argument('--demo_id', type=str, default=None, help='Specific demo ID to use (if None, use first available)')
     parser.add_argument('--target_object_id', type=str, default=None, help='Specific object ID to track (if None, use first available)')
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'sequential'], 
