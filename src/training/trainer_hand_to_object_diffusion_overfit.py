@@ -306,6 +306,7 @@ def train_overfit(opt, device):
         sampling_strategy="random",
         split="mini",
         split_seed=42,  # Use same seed for consistent splits
+        noise_scheme='real',
     )
 
     # Create combined dataset for final evaluation
@@ -572,7 +573,7 @@ def train_overfit(opt, device):
                     left_hand_raw,
                     right_hand_raw,
                     object_motion_raw,
-                    object_noisy=sample["target_noisy_raw"],
+                    object_noisy=sample["traj_noisy_raw"].unsqueeze(0).to(device),
                     object_pred=object_pred_raw,
                     seq_len=seq_len,
                     is_moving=is_moving,

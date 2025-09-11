@@ -1,5 +1,7 @@
+
 #!/usr/bin/env python3
 
+from copy import deepcopy
 import os
 import numpy as np
 import pickle
@@ -35,6 +37,13 @@ def load_pickle(path):
             if k.startswith(f"obj_{uid}"):
                 new_key = k.replace(f"obj_{uid}_", "")
                 objects[uid][new_key] = data[k]
+        # get wTo_shelf
+        cTo_shelf = objects[uid]['cTo_shelf']
+        wTc = data['wTc']
+        # cTw = np.linalg.inv(wTc)  
+        wTo_shelf = wTc @ cTo_shelf
+        objects[uid]['wTo_shelf'] = wTo_shelf
+
     processed_data["left_hand"] = {}
     processed_data["right_hand"] = {}
     for k in data:
@@ -45,6 +54,8 @@ def load_pickle(path):
                 processed_data["right_hand"][k.replace("right_hand_", "")] = data[k]
             else:
                 processed_data[k] = data[k]
+
+
 
     processed_data["objects"] = objects
     seq_index = osp.basename(path).split(".")[0]
@@ -92,6 +103,7 @@ class HandToObjectDataset(Dataset):
         noise_std_mano_body_rot=0.0,
         noise_std_mano_trans=0.0,
         noise_std_mano_betas=0.0,
+        noise_scheme='syn',  # 'syn', 'real'
     ):
         self.data_path = data_path
         self.window_size = window_size
@@ -156,6 +168,7 @@ class HandToObjectDataset(Dataset):
             "object_rot": noise_std_obj_rot,
             "object_trans": noise_std_obj_trans,
         }
+        self.noise_scheme = noise_scheme
 
     def _filter_data(self, single_demo=None, single_object=None):
         """Filter data for overfitting on specific demo/object."""
@@ -291,6 +304,22 @@ class HandToObjectDataset(Dataset):
                         object_quat[np.newaxis],
                     )
 
+                    object_shelf = demo_data["objects"][obj_id]["wTo_shelf"][start_idx:end_idx]
+                    object_shelf_pos = object_shelf[:, :3, 3]
+                    object_shelf_r = R.from_matrix(object_shelf[:, :3, :3])
+                    object_shelf_quat = object_shelf_r.as_quat()[
+                        :, [3, 0, 1, 2]
+                    ]
+
+                    _, _, cano_object_shelf_pos, cano_object_shelf_quat, _ = (
+                        rotate_at_frame_w_obj(
+                            camera_pos[np.newaxis, :, np.newaxis, :],
+                            camera_quat[np.newaxis, :, np.newaxis, :],
+                            object_shelf_pos[np.newaxis],
+                            object_shelf_quat[np.newaxis],
+                        )
+                    )
+
                     _, _, cano_left_wrist_pos, cano_left_wrist_quat, _ = (
                         rotate_at_frame_w_obj(
                             camera_pos[np.newaxis, :, np.newaxis, :],
@@ -390,6 +419,12 @@ class HandToObjectDataset(Dataset):
                     cano_camera_rot_mat = quaternion_to_matrix_numpy(cano_camera_quat)
                     cano_camera_rot6d = matrix_to_rotation_6d_numpy(cano_camera_rot_mat)
 
+                    cano_object_shelf_rot_mat = quaternion_to_matrix_numpy(cano_object_shelf_quat)
+                    cano_object_shelf_rot6d = matrix_to_rotation_6d_numpy(cano_object_shelf_rot_mat)
+                    cano_object_shelf_data = np.concatenate(
+                        (cano_object_shelf_pos, cano_object_shelf_rot6d), axis=-1
+                    )
+
                     cano_left_hand_data = np.concatenate(
                         (cano_left_wrist_pos, cano_left_wrist_rot6d), axis=-1
                     )
@@ -410,6 +445,8 @@ class HandToObjectDataset(Dataset):
                         "end_idx": end_idx,
                         # 'left_hand': cano_left_hand_data,
                         # 'right_hand': cano_right_hand_data,
+
+                        "object_shelf": cano_object_shelf_data,
                         "object": cano_object_data,
                         "camera": cano_camera_data,
                         "left_hand": cano_left_positions.reshape(-1, 21 * 3),
@@ -723,10 +760,9 @@ class HandToObjectDataset(Dataset):
         )  # [T, 3*D]
 
         return {
-            # 'traj_noisy': traj_noisy_norm,  #
             "condition": condition,  # [T, 2*D] - left and right hand trajectories
             "target": object_norm,  # [T, D] - object trajectory to denoise
-            "traj_noisy_raw": window_noisy["object"],
+            "traj_noisy_raw": to_tensor(window_noisy["object"]),
             "hand_raw": torch.cat(
                 [left_hand, right_hand], dim=-1
             ),  # [T, 2*D] - left and right hand trajectories
@@ -739,7 +775,15 @@ class HandToObjectDataset(Dataset):
 
     def add_noise_data(self, can_window_dict):
         # just for 6d pose for now
-
+        if self.noise_scheme == 'real':
+            print('apply real noise')
+            can_window_dict_noisy = deepcopy(can_window_dict)
+            can_window_dict_noisy['object'] = can_window_dict['object_shelf']  # [T, D]
+            # add mask
+            mask = can_window_dict_noisy['shelf_valid'] # [T, ]
+            can_window_dict_noisy['object'] = can_window_dict_noisy['object'] * mask[:, None]
+            return can_window_dict_noisy
+        
         ######################################## add noise to  params
 
         can_window_dict_noisy = {}

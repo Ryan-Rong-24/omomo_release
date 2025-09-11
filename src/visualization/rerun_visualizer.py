@@ -240,9 +240,6 @@ class RerunVisualizer:
         )
 
         # Log hand pose as point cloud [B=0, T=0/-1, J=21, 3] the the start and last frame
-        print(
-            "left hand shape: ", left_hand.shape, left_hand[0, 0, :, :3].cpu().numpy()
-        )
         for t in [0, -1]:
             rr.log(
                 f"training/left_hand_pose/frame_{t}",
@@ -271,6 +268,7 @@ class RerunVisualizer:
                 ),
             )
         if object_noisy is not None:
+            print('object_noisy shape: ', object_noisy.shape, object_gt.shape)
             object_pos_noisy = object_noisy[0, :valid_len, :3].cpu().numpy()
             rr.log(
                 "training/object_noisy_traj",
