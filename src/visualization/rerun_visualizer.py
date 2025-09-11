@@ -189,6 +189,7 @@ class RerunVisualizer:
         seq_len=None,
         is_moving=None,
         mean_velocity=None,
+        pref='training/',
     ):
         """Log training step with trajectories and MANO hands"""
         if not self.enable_visualization:
@@ -227,22 +228,22 @@ class RerunVisualizer:
 
         # Log trajectories
         rr.log(
-            "training/left_hand_traj",
+            f"{pref}/left_hand_traj",
             rr.LineStrips3D([left_pos], colors=[[0, 255, 0]], radii=[0.01]),
         )
         rr.log(
-            "training/right_hand_traj",
+            f"{pref}/right_hand_traj",
             rr.LineStrips3D([right_pos], colors=[[0, 0, 255]], radii=[0.01]),
         )
         rr.log(
-            "training/object_gt_traj",
+            f"{pref}/object_gt_traj",
             rr.LineStrips3D([object_pos_gt], colors=[[255, 0, 0]], radii=[0.015]),
         )
 
         # Log hand pose as point cloud [B=0, T=0/-1, J=21, 3] the the start and last frame
         for t in [0, -1]:
             rr.log(
-                f"training/left_hand_pose/frame_{t}",
+                f"{pref}/left_hand_pose/frame_{t}",
                 rr.Points3D(
                     left_hand[0, t, :, :3].cpu().numpy(),
                     colors=[[0, 255, 0]],
@@ -250,7 +251,7 @@ class RerunVisualizer:
                 ),
             )
             rr.log(
-                f"training/right_hand_pose/frame_{t}",
+                f"{pref}/right_hand_pose/frame_{t}",
                 rr.Points3D(
                     right_hand[0, t, :, :3].cpu().numpy(),
                     colors=[[0, 0, 255]],
@@ -262,7 +263,7 @@ class RerunVisualizer:
         if object_pred is not None:
             object_pos_pred = object_pred[0, :valid_len, :3].cpu().numpy()
             rr.log(
-                "training/object_pred_traj",
+                f"{pref}/object_pred_traj",
                 rr.LineStrips3D(
                     [object_pos_pred], colors=[[255, 165, 0]], radii=[0.015]
                 ),
@@ -271,7 +272,7 @@ class RerunVisualizer:
             print('object_noisy shape: ', object_noisy.shape, object_gt.shape)
             object_pos_noisy = object_noisy[0, :valid_len, :3].cpu().numpy()
             rr.log(
-                "training/object_noisy_traj",
+                f"{pref}/object_noisy_traj",
                 rr.LineStrips3D(
                     [object_pos_noisy], colors=[[255, 0, 255]], radii=[0.015]
                 ),
@@ -279,7 +280,7 @@ class RerunVisualizer:
 
         # Log MANO hands at current position
         if valid_len > 0 and self.left_mano is not None:
-            self._log_mano_hands(left_pos[-1], right_pos[-1])
+            self._log_mano_hands(left_pos[-1], right_pos[-1], pref)
 
         # Log metadata
         metadata = f"Step: {step}"
@@ -289,13 +290,13 @@ class RerunVisualizer:
             metadata += f", Moving: {is_moving}"
         if mean_velocity is not None:
             metadata += f", Vel: {mean_velocity:.4f}"
-        rr.log("training/info", rr.TextDocument(metadata))
+        rr.log(f"{pref}/info", rr.TextDocument(metadata))
 
         # Note: We're recording continuously to training_session.rrd, no need for periodic saves
         # except Exception as e:
         #     print(f"⚠️ Training step logging failed: {e}")
 
-    def _log_mano_hands(self, left_pos, right_pos):
+    def _log_mano_hands(self, left_pos, right_pos, pref):
         """Log MANO hand meshes at positions"""
         try:
             # Left hand
@@ -303,7 +304,7 @@ class RerunVisualizer:
                 left_output = self.left_mano()
                 left_vertices = left_output.vertices[0].numpy() + left_pos
                 rr.log(
-                    "training/left_hand_mesh",
+                    f"{pref}/left_hand_mesh",
                     rr.Mesh3D(
                         vertex_positions=left_vertices,
                         triangle_indices=self.left_mano.faces,
@@ -316,7 +317,7 @@ class RerunVisualizer:
                 right_output = self.right_mano()
                 right_vertices = right_output.vertices[0].numpy() + right_pos
                 rr.log(
-                    "training/right_hand_mesh",
+                    f"{pref}/right_hand_mesh",
                     rr.Mesh3D(
                         vertex_positions=right_vertices,
                         triangle_indices=self.right_mano.faces,

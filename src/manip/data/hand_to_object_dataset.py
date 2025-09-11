@@ -55,8 +55,6 @@ def load_pickle(path):
             else:
                 processed_data[k] = data[k]
 
-
-
     processed_data["objects"] = objects
     seq_index = osp.basename(path).split(".")[0]
 
@@ -65,7 +63,6 @@ def load_pickle(path):
 
 # in rohm:
 # init(): create windows -> canonical --> add noise --> get rep
-
 
 def to_tensor(array, dtype=torch.float32):
     """Convert array to tensor with specified dtype."""
@@ -347,6 +344,9 @@ class HandToObjectDataset(Dataset):
                     cano_right_wrist_pos = cano_right_wrist_pos[0]  # T X 3
                     cano_right_wrist_quat = cano_right_wrist_quat[0]  # T X 4
 
+                    cano_object_shelf_pos = cano_object_shelf_pos[0]  # T X 3
+                    cano_object_shelf_quat = cano_object_shelf_quat[0]  # T X 4
+
                     cano_camera_pos = cano_camera_pos[0, :, 0, :]  # T X 3
                     cano_camera_quat = cano_camera_quat[0, :, 0, :]  # T X 4
 
@@ -437,6 +437,7 @@ class HandToObjectDataset(Dataset):
                     cano_camera_data = np.concatenate(
                         (cano_camera_pos, cano_camera_rot6d), axis=-1
                     )
+                    shelf_valid = demo_data["objects"][obj_id]["shelf_valid"][start_idx:end_idx]
 
                     window_data = {
                         "demo_id": demo_id,
@@ -445,7 +446,7 @@ class HandToObjectDataset(Dataset):
                         "end_idx": end_idx,
                         # 'left_hand': cano_left_hand_data,
                         # 'right_hand': cano_right_hand_data,
-
+                        "shelf_valid": shelf_valid,
                         "object_shelf": cano_object_shelf_data,
                         "object": cano_object_data,
                         "camera": cano_camera_data,
@@ -777,11 +778,13 @@ class HandToObjectDataset(Dataset):
         # just for 6d pose for now
         if self.noise_scheme == 'real':
             print('apply real noise')
+            print('valid shape', can_window_dict['shelf_valid'].shape, can_window_dict['object_shelf'].shape, can_window_dict['object'].shape)
             can_window_dict_noisy = deepcopy(can_window_dict)
             can_window_dict_noisy['object'] = can_window_dict['object_shelf']  # [T, D]
             # add mask
             mask = can_window_dict_noisy['shelf_valid'] # [T, ]
             can_window_dict_noisy['object'] = can_window_dict_noisy['object'] * mask[:, None]
+            print('after masking', can_window_dict_noisy['object'].shape)
             return can_window_dict_noisy
         
         ######################################## add noise to  params
@@ -905,24 +908,55 @@ def create_hand_to_object_dataset(
         augment=augment,
     )
 
+def vis_traj():
+    import plotly.graph_objects as go
+    data =load_pickle('/move/u/yufeiy2/data/HOT3D/pred_pose/mini_P0001_624f2ba9.npz')
+    for demo_id, demo_data in data.items():
+        fig = go.Figure()
+        for uid, obj_data in demo_data['objects'].items():
+            wTo = obj_data['wTo']  # (T, 4, 4)
+            wTo_shelf = obj_data['wTo_shelf']  # (T, 4, 4)
+            wTo_shelf_valid = obj_data['shelf_valid']  # (T, )
+
+            wTo_pos = wTo[:, :3, 3]
+            wTo_shelf_pos = wTo_shelf[:, :3, 3]
+
+            # plot as connecting 3D lines
+            fig.add_trace(go.Scatter3d(
+                x=wTo_pos[:, 0], y=wTo_pos[:, 1], z=wTo_pos[:, 2],
+                mode='lines',
+                name=f"wTo_{uid}"
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=wTo_shelf_pos[:, 0], y=wTo_shelf_pos[:, 1], z=wTo_shelf_pos[:, 2],
+                mode='lines',
+                name=f"shelf_{uid}"
+            ))
+        os.makedirs('outputs', exist_ok=True)
+        fig.write_html(f'outputs/traj_{demo_id}.html')
+
+        break
 
 if __name__ == "__main__":
-    # Test the dataset (default 9D format)
-    dataset = create_hand_to_object_dataset(
-        data_path="data/processed_data.pkl",
-        window_size=120,
-        use_velocity=False,  # Default: 9D format (pos + rot)
-        single_demo="P0001_10a27bf7",  # For overfitting test
-        single_object="37787722328019",
-    )
+    # # Test the dataset (default 9D format)
+    # dataset = create_hand_to_object_dataset(
+    #     data_path="data/processed_data.pkl",
+    #     window_size=120,
+    #     use_velocity=False,  # Default: 9D format (pos + rot)
+    #     single_demo="P0001_10a27bf7",  # For overfitting test
+    #     single_object="37787722328019",
+    # )
 
-    print(f"Dataset size: {len(dataset)}")
+    # print(f"Dataset size: {len(dataset)}")
 
-    if len(dataset) > 0:
-        sample = dataset[0]
-        print(f"Sample shapes:")
-        print(f"  Condition: {sample['condition'].shape}")  # [T, 2*D]
-        print(f"  Target: {sample['target'].shape}")  # [T, D]
-        print(f"  Demo ID: {sample['demo_id']}")
-        print(f"  Object ID: {sample['object_id']}")
-        print(f"  Is motion: {sample['is_motion']}")
+    # if len(dataset) > 0:
+    #     sample = dataset[0]
+    #     print(f"Sample shapes:")
+    #     print(f"  Condition: {sample['condition'].shape}")  # [T, 2*D]
+    #     print(f"  Target: {sample['target'].shape}")  # [T, D]
+    #     print(f"  Demo ID: {sample['demo_id']}")
+    #     print(f"  Object ID: {sample['object_id']}")
+    #     print(f"  Is motion: {sample['is_motion']}")
+
+
+    vis_traj()
