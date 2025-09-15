@@ -83,6 +83,7 @@ class HandToObjectDataset(Dataset):
     def __init__(
         self,
         data_path,
+        is_train=False,
         window_size=120,
         use_velocity=False,  # Use 12D format (pos + vel + rot) vs 9D (pos + rot) - default is 9D
         single_demo=None,  # For overfitting: specify demo_id
@@ -102,6 +103,7 @@ class HandToObjectDataset(Dataset):
         noise_std_mano_betas=0.0,
         noise_scheme='syn',  # 'syn', 'real'
     ):
+        self.is_train = is_train
         self.data_path = data_path
         self.window_size = window_size
         self.use_velocity = use_velocity
@@ -725,9 +727,13 @@ class HandToObjectDataset(Dataset):
         return data * std + mean
 
     def __len__(self):
-        return len(self.windows)
+        if self.is_train:
+            return max(1000, len(self.windows))
+        else:
+            return len(self.windows)
 
     def __getitem__(self, idx):
+        idx = idx % len(self.windows)
         # For debug (overfitting)
         idx = 0
 

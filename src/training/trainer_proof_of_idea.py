@@ -1,50 +1,169 @@
 import argparse
+import json
 import os
-import numpy as np
-import yaml
 import random
-import json 
-
-import trimesh 
-
-from tqdm import tqdm
 from pathlib import Path
 
-import wandb
-
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim import Adam
-from torch.utils.data import DataLoader, TensorDataset
-from torch.cuda.amp import autocast, GradScaler
-from torch.utils import data
-
 import torch.nn.functional as F
-
-from src.utils.rotation_utils import transforms 
-
+import trimesh
+import wandb
+import yaml
 from ema_pytorch import EMA
-from multiprocessing import cpu_count
-
-from human_body_prior.body_model.body_model import BodyModel
-
-from manip.data.hand_foot_dataset import HandFootManipDataset, quat_ik_torch, quat_fk_torch
-
-from manip.model.transformer_hand_foot_manip_cond_diffusion_model import CondGaussianDiffusion 
-
-from manip.vis.blender_vis_mesh_motion import run_blender_rendering_and_save2video, save_verts_faces_to_mesh_file_w_object
-
-from manip.model.transformer_fullbody_cond_diffusion_model import CondGaussianDiffusion as FullBodyCondGaussianDiffusion
-from trainer_full_body_manip_diffusion import Trainer as FullBodyTrainer 
-
-from evaluation_metrics import compute_metrics, compute_s1_metrics, compute_collision
-
+# from evaluation_metrics import compute_metrics
+# from evaluation_metrics import compute_collision
+from jutils import model_utils
 from matplotlib import pyplot as plt
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import Adam
+from torch.utils import data
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+from ..manip.data.hand_to_object_dataset import HandToObjectDataset
+from ..manip.model.transformer_hand_to_object_diffusion_model import \
+    CondGaussianDiffusion
+from ..utils.rotation_utils import transforms
+from ..visualization.rerun_visualizer import RerunVisualizer
+
+# from multiprocessing import cpu_count
+
+# from human_body_prior.body_model.body_model import BodyModel
+
+# from .manip.data.hand_foot_dataset import (
+#     HandFootManipDataset,
+#     quat_ik_torch,
+#     quat_fk_torch,
+# )
+
+
+
+# from .manip.vis.blender_vis_mesh_motion import (
+#     run_blender_rendering_and_save2video,
+#     save_verts_faces_to_mesh_file_w_object,
+# )
+
+
+
+
+def run_smplx_model(
+    root_trans, aa_rot_rep, betas, gender, bm_dict, return_joints24=False
+):
+    # root_trans: BS X T X 3
+    # aa_rot_rep: BS X T X 22 X 3
+    # betas: BS X 16
+    # gender: BS
+    bs, num_steps, num_joints, _ = aa_rot_rep.shape
+    if num_joints != 52:
+        padding_zeros_hand = torch.zeros(bs, num_steps, 30, 3).to(
+            aa_rot_rep.device
+        )  # BS X T X 30 X 3
+        aa_rot_rep = torch.cat(
+            (aa_rot_rep, padding_zeros_hand), dim=2
+        )  # BS X T X 52 X 3
+
+    aa_rot_rep = aa_rot_rep.reshape(bs * num_steps, -1, 3)  # (BS*T) X n_joints X 3
+    betas = (
+        betas[:, None, :].repeat(1, num_steps, 1).reshape(bs * num_steps, -1)
+    )  # (BS*T) X 16
+    gender = np.asarray(gender)[:, np.newaxis].repeat(num_steps, axis=1)
+    gender = gender.reshape(-1).tolist()  # (BS*T)
+
+    smpl_trans = root_trans.reshape(-1, 3)  # (BS*T) X 3
+    smpl_betas = betas  # (BS*T) X 16
+    smpl_root_orient = aa_rot_rep[:, 0, :]  # (BS*T) X 3
+    smpl_pose_body = aa_rot_rep[:, 1:22, :].reshape(-1, 63)  # (BS*T) X 63
+    smpl_pose_hand = aa_rot_rep[:, 22:, :].reshape(-1, 90)  # (BS*T) X 90
+
+    B = smpl_trans.shape[0]  # (BS*T)
+
+    smpl_vals = [
+        smpl_trans,
+        smpl_root_orient,
+        smpl_betas,
+        smpl_pose_body,
+        smpl_pose_hand,
+    ]
+    # batch may be a mix of genders, so need to carefully use the corresponding SMPL body model
+    gender_names = ["male", "female"]
+    pred_joints = []
+    pred_verts = []
+    prev_nbidx = 0
+    cat_idx_map = np.ones((B), dtype=int) * -1
+    for gender_name in gender_names:
+        gender_idx = np.array(gender) == gender_name
+        nbidx = np.sum(gender_idx)
+
+        cat_idx_map[gender_idx] = np.arange(prev_nbidx, prev_nbidx + nbidx, dtype=int)
+        prev_nbidx += nbidx
+
+        gender_smpl_vals = [val[gender_idx] for val in smpl_vals]
+
+        if nbidx == 0:
+            # skip if no frames for this gender
+            continue
+
+        # reconstruct SMPL
+        (
+            cur_pred_trans,
+            cur_pred_orient,
+            cur_betas,
+            cur_pred_pose,
+            cur_pred_pose_hand,
+        ) = gender_smpl_vals
+        bm = bm_dict[gender_name]
+
+        pred_body = bm(
+            pose_body=cur_pred_pose,
+            pose_hand=cur_pred_pose_hand,
+            betas=cur_betas,
+            root_orient=cur_pred_orient,
+            trans=cur_pred_trans,
+        )
+
+        pred_joints.append(pred_body.Jtr)
+        pred_verts.append(pred_body.v)
+
+    # cat all genders and reorder to original batch ordering
+    if return_joints24:
+        x_pred_smpl_joints_all = torch.cat(pred_joints, axis=0)  # () X 52 X 3
+        lmiddle_index = 28
+        rmiddle_index = 43
+        x_pred_smpl_joints = torch.cat(
+            (
+                x_pred_smpl_joints_all[:, :22, :],
+                x_pred_smpl_joints_all[:, lmiddle_index : lmiddle_index + 1, :],
+                x_pred_smpl_joints_all[:, rmiddle_index : rmiddle_index + 1, :],
+            ),
+            dim=1,
+        )
+    else:
+        x_pred_smpl_joints = torch.cat(pred_joints, axis=0)[:, :num_joints, :]
+
+    x_pred_smpl_joints = x_pred_smpl_joints[cat_idx_map]  # (BS*T) X 22 X 3
+
+    x_pred_smpl_verts = torch.cat(pred_verts, axis=0)
+    x_pred_smpl_verts = x_pred_smpl_verts[cat_idx_map]  # (BS*T) X 6890 X 3
+
+    x_pred_smpl_joints = x_pred_smpl_joints.reshape(
+        bs, num_steps, -1, 3
+    )  # BS X T X 22 X 3/BS X T X 24 X 3
+    x_pred_smpl_verts = x_pred_smpl_verts.reshape(
+        bs, num_steps, -1, 3
+    )  # BS X T X 6890 X 3
+
+    mesh_faces = pred_body.f
+
+    return x_pred_smpl_joints, x_pred_smpl_verts, mesh_faces
+
 
 def cycle(dl):
     while True:
         for data in dl:
             yield data
+
 
 class Trainer(object):
     def __init__(
@@ -61,24 +180,31 @@ class Trainer(object):
         step_start_ema=2000,
         ema_update_every=10,
         save_and_sample_every=40000,
-        results_folder='./results',
-        use_wandb=True,  
+        results_folder="./results",
+        use_wandb=True,
     ):
         super().__init__()
 
-        self.use_wandb = use_wandb           
+        self.use_wandb = use_wandb
         if self.use_wandb:
             # Loggers
-            wandb.init(config=opt, project=opt.wandb_pj_name, entity=opt.entity, \
-            name=opt.exp_name, dir=opt.save_dir)
+            wandb.init(
+                config=opt,
+                project=opt.wandb_pj_name,
+                name=opt.exp_name,
+                dir=opt.save_dir,
+            )
+        self.batch_size = train_batch_size
+        self.prep_dataloader(window_size=opt.window)
 
         self.model = diffusion_model
+        diffusion_model.set_metadata(self.ds.stats)
+        diffusion_model.to(device)
         self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
 
-        self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
 
@@ -93,115 +219,240 @@ class Trainer(object):
 
         self.vis_folder = results_folder.replace("weights", "vis_res")
 
-        self.opt = opt 
+        self.opt = opt
+
+        self.data_root_folder = self.opt.data_root_folder
 
         self.window = opt.window
 
-        self.use_object_split = self.opt.use_object_split 
+        self.use_object_split = self.opt.use_object_split
 
-        self.data_root_folder = self.opt.data_root_folder 
+        # self.bm_dict = self.ds.bm_dict
 
-        self.prep_dataloader(window_size=opt.window)
+        self.test_on_train = self.opt.test_sample_res_on_train
 
-        self.bm_dict = self.ds.bm_dict 
+        self.add_hand_processing = self.opt.add_hand_processing
 
-        self.test_on_train = self.opt.test_sample_res_on_train 
+        self.for_quant_eval = self.opt.for_quant_eval
 
-        self.add_hand_processing = self.opt.add_hand_processing 
-
-        self.for_quant_eval = self.opt.for_quant_eval 
-
-        self.use_gt_hand_for_eval = self.opt.use_gt_hand_for_eval 
+        self.visualizer = RerunVisualizer(
+            exp_name=opt.exp_name,
+            save_dir=opt.save_dir,
+            enable_visualization=True,
+            mano_models_dir=getattr(opt, "mano_models_dir", "data/mano_models"),
+            object_mesh_dir=getattr(opt, "object_mesh_dir", "data/object_meshes"),
+            use_hand_articulations=getattr(opt, "use_hand_articulations", False),
+            hand_articulations_path=getattr(
+                opt, "hand_articulations_path", "data/hand_articulations.pkl"
+            ),
+        )
 
     def prep_dataloader(self, window_size):
         # Define dataset
-        train_dataset = HandFootManipDataset(train=True, data_root_folder=self.data_root_folder, \
-            window=window_size, use_object_splits=self.use_object_split, split='mini')
-        val_dataset = HandFootManipDataset(train=False, data_root_folder=self.data_root_folder, \
-            window=window_size, use_object_splits=self.use_object_split, split='mini')
+        # train_dataset = HandToObjectDataset(
+        #     train=True,
+        #     data_root_folder=self.data_root_folder,
+        #     window=window_size,
+        #     use_object_splits=self.use_object_split,
+        # )
+        # val_dataset = HandFootManipDataset(
+        #     train=False,
+        #     data_root_folder=self.data_root_folder,
+        #     window=window_size,
+        #     use_object_splits=self.use_object_split,
+        # )
 
-        self.ds = train_dataset 
+        train_dataset = HandToObjectDataset(
+            is_train=True,
+            data_path=opt.data_path,
+            window_size=opt.window,
+            use_velocity=opt.use_velocity,
+            single_demo=opt.demo_id,
+            single_object=opt.target_object_id,
+            sampling_strategy="random",
+            split="mini",
+            split_seed=42,  # Ensure reproducible splits
+            noise_scheme='syn',
+            noise_std_obj_rot=opt.noise_std_obj_rot,
+            noise_std_obj_trans=opt.noise_std_obj_trans,
+
+            noise_std_mano_global_rot=opt.noise_std_mano_global_rot,
+            noise_std_mano_body_rot=opt.noise_std_mano_body_rot,
+            noise_std_mano_trans=opt.noise_std_mano_trans,
+            noise_std_mano_betas=opt.noise_std_mano_betas
+
+        )
+
+        val_dataset = HandToObjectDataset(
+            is_train=False,
+            data_path=opt.data_path,
+            window_size=opt.window,
+            use_velocity=opt.use_velocity,
+            single_demo=opt.demo_id,
+            single_object=opt.target_object_id,
+            sampling_strategy="random",
+            split="mini",
+            split_seed=42,  # Use same seed for consistent splits
+            noise_scheme='real',
+        )        
+
+        self.ds = train_dataset
         self.val_ds = val_dataset
-        self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, \
-            shuffle=True, pin_memory=True, num_workers=4))
-        self.val_dl = cycle(data.DataLoader(self.val_ds, batch_size=self.batch_size, \
-            shuffle=False, pin_memory=True, num_workers=4))
+        self.dl = cycle(
+            data.DataLoader(
+                self.ds,
+                batch_size=self.batch_size,
+                shuffle=True,
+                pin_memory=True,
+                num_workers=4,
+            )
+        )
+        self.val_dl = cycle(
+            data.DataLoader(
+                self.val_ds,
+                batch_size=self.batch_size,
+                shuffle=False,
+                pin_memory=True,
+                num_workers=4,
+            )
+        )
 
     def save(self, milestone):
         data = {
-            'step': self.step,
-            'model': self.model.state_dict(),
-            'ema': self.ema.state_dict(),
-            'scaler': self.scaler.state_dict()
+            "step": self.step,
+            "model": self.model.state_dict(),
+            "ema": self.ema.state_dict(),
+            "scaler": self.scaler.state_dict(),
         }
-        torch.save(data, os.path.join(self.results_folder, 'model-'+str(milestone)+'.pt'))
+        torch.save(
+            data, os.path.join(self.results_folder, "model-" + str(milestone) + ".pt")
+        )
 
     def load(self, milestone, pretrained_path=None):
         if pretrained_path is None:
-            data = torch.load(os.path.join(self.results_folder, 'model-'+str(milestone)+'.pt'))
+            data = torch.load(
+                os.path.join(self.results_folder, "model-" + str(milestone) + ".pt")
+            )
         else:
             data = torch.load(pretrained_path)
 
-        self.step = data['step']
-        self.model.load_state_dict(data['model'], strict=False)
-        self.ema.load_state_dict(data['ema'], strict=False)
-        self.scaler.load_state_dict(data['scaler'])
+        self.step = data["step"]
+        self.model.load_state_dict(data["model"], strict=False)
+        self.ema.load_state_dict(data["ema"], strict=False)
+        self.scaler.load_state_dict(data["scaler"])
 
     def prep_temporal_condition_mask(self, data, t_idx=0):
-        # Missing regions are ones, the condition regions are zeros. 
-        mask = torch.ones_like(data).to(data.device) # BS X T X D 
-        mask[:, t_idx, :] = torch.zeros(data.shape[0], data.shape[2]).to(data.device) # BS X D  
+        # Missing regions are ones, the condition regions are zeros.
+        mask = torch.ones_like(data).to(data.device)  # BS X T X D
+        mask[:, t_idx, :] = torch.zeros(data.shape[0], data.shape[2]).to(
+            data.device
+        )  # BS X D
 
-        return mask 
+        return mask
+
+    def prep_joint_condition_mask(self, data, joint_idx, pos_only):
+        # data: BS X T X D
+        # head_idx = 15
+        # hand_idx = 20, 21
+        # Condition part is zeros, while missing part is ones.
+        mask = torch.ones_like(data).to(data.device)
+
+        cond_pos_dim_idx = joint_idx * 3
+        cond_rot_dim_idx = 24 * 3 + joint_idx * 6
+
+        mask[:, :, cond_pos_dim_idx : cond_pos_dim_idx + 3] = torch.zeros(
+            data.shape[0], data.shape[1], 3
+        ).to(data.device)
+
+        if not pos_only:
+            mask[:, :, cond_rot_dim_idx : cond_rot_dim_idx + 6] = torch.zeros(
+                data.shape[0], data.shape[1], 6
+            ).to(data.device)
+
+        return mask
 
     def train(self):
-        init_step = self.step 
-        for idx in range(init_step, self.train_num_steps):
+        init_step = self.step
+        for idx in tqdm(range(init_step, self.train_num_steps)):
             self.optimizer.zero_grad()
 
-            nan_exists = False # If met nan in loss or gradient, need to skip to next data. 
+            nan_exists = (
+                False  # If met nan in loss or gradient, need to skip to next data.
+            )
             for i in range(self.gradient_accumulate_every):
-                data_dict = next(self.dl)
-                data = data_dict['motion'].cuda() # BS X T X (22*3+22*6)
+                sample = next(self.dl)
+                sample = model_utils.to_cuda(sample)
 
-                bs, num_steps, _ = data.shape 
+                object_motion = sample["target"].cuda()
+                cond = sample["condition"].cuda()
+                seq_len = torch.tensor([cond.shape[1]]).to(
+                    device
+                )  # [1] - sequence length
 
-                data = self.extract_palm_jpos_only_data(data)
-                # BS X T X (2*3) 
+                ######### add occlusion mask for traj repr, with some schedules
+                mask_prob = 0.5
+                max_infill_ratio = 0.1
+                prob = random.uniform(0, 1)
+                batch_size, clip_len, _ = cond.shape
+                if prob > 1 - mask_prob:
+                    traj_feat_dim = sample["traj_noisy_raw"].shape[-1]
+                    start = torch.FloatTensor(batch_size).uniform_(0, clip_len - 1).long()
+                    mask_len = (
+                        clip_len
+                        * torch.FloatTensor(batch_size).uniform_(0, 1)
+                        * max_infill_ratio
+                    ).long()
+                    end = start + mask_len
+                    end[end > clip_len] = clip_len
+                    mask_traj = torch.ones(batch_size, clip_len).to(device)  # [bs, t]
+                    for bs in range(batch_size):
+                        mask_traj[bs, start[bs] : end[bs]] = 0
+                    mask_traj_exp = mask_traj.unsqueeze(-1).repeat(
+                        1, 1, traj_feat_dim
+                    )  # [bs, t, 4]
+                    cond[:, :, -traj_feat_dim:] = (
+                        cond[:, :, -traj_feat_dim:] * mask_traj_exp
+                    )
+                else:
+                    mask_traj = torch.ones(batch_size, clip_len).to(device)
 
-                obj_bps_data = data_dict['obj_bps'].cuda() 
-                obj_com_pos = data_dict['obj_com_pos'].cuda() # BS X T X 3 
+                # Extract data from sample and move to device
+                # Generate padding mask
+                actual_seq_len = seq_len + 1
+                tmp_mask = torch.arange(opt.window + 1, device=device).expand(
+                    1, opt.window + 1
+                ) < actual_seq_len[:, None].repeat(1, opt.window + 1)
+                padding_mask = tmp_mask[:, None, :]
 
-                ori_data_cond = torch.cat((obj_com_pos, obj_bps_data), dim=-1) # BS X T X (3+1024*3)
+                with autocast(enabled=self.amp):
+                    loss_diffusion = self.model(object_motion, cond, padding_mask)
 
-                cond_mask = None 
-
-                # Generate padding mask 
-                actual_seq_len = data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
-                tmp_mask = torch.arange(self.window+1).expand(data.shape[0], \
-                self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
-                # BS X max_timesteps
-                padding_mask = tmp_mask[:, None, :].to(data.device)
-
-                with autocast(enabled = self.amp):    
-                    loss_diffusion = self.model(data, ori_data_cond, cond_mask, padding_mask)
-                    
                     loss = loss_diffusion
 
                     if torch.isnan(loss).item():
-                        print('WARNING: NaN loss. Skipping to next data...')
-                        nan_exists = True 
+                        print("WARNING: NaN loss. Skipping to next data...")
+                        nan_exists = True
                         torch.cuda.empty_cache()
                         continue
 
                     self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
                     # check gradients
-                    parameters = [p for p in self.model.parameters() if p.grad is not None]
-                    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2.0).to(data.device) for p in parameters]), 2.0)
+                    parameters = [
+                        p for p in self.model.parameters() if p.grad is not None
+                    ]
+                    total_norm = torch.norm(
+                        torch.stack(
+                            [
+                                torch.norm(p.grad.detach(), 2.0)
+                                for p in parameters
+                            ]
+                        ),
+                        2.0,
+                    )
                     if torch.isnan(total_norm):
-                        print('WARNING: NaN gradients. Skipping to next data...')
-                        nan_exists = True 
+                        print("WARNING: NaN gradients. Skipping to next data...")
+                        nan_exists = True
                         torch.cuda.empty_cache()
                         continue
 
@@ -212,7 +463,7 @@ class Trainer(object):
                         }
                         wandb.log(log_dict)
 
-                    if idx % 10 == 0 and i == 0:
+                    if idx % 50 == 0 and i == 0:
                         print("Step: {0}".format(idx))
                         print("Loss: %.4f" % (loss.item()))
 
@@ -224,347 +475,178 @@ class Trainer(object):
 
             self.ema.update()
 
-            if self.step != 0 and self.step % 10 == 0:
+            if self.step % opt.eval_every == 0:
+                # evaluation step
                 self.ema.ema_model.eval()
 
                 with torch.no_grad():
                     val_data_dict = next(self.val_dl)
-                    val_data = val_data_dict['motion'].cuda()
+                    val_data_dict = model_utils.to_cuda(val_data_dict)
 
-                    bs, num_steps, _ = val_data.shape 
+                    self.validation_step(val_data_dict)
+                    # val_data = val_data_dict['motion'].cuda()
 
-                    val_data = self.extract_palm_jpos_only_data(val_data)
-                    # BS X T X (2*3) 
+                    # if cond_mask is not None:
+                    #     cond_mask = cond_mask * left_joint_mask * right_joint_mask
+                    # else:
+                    #     cond_mask = left_joint_mask * right_joint_mask
 
-                    obj_bps_data = val_data_dict['obj_bps'].cuda()
-                    obj_com_pos = val_data_dict['obj_com_pos'].cuda() 
+                    # # Generate padding mask
+                    # actual_seq_len = val_data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level
+                    # tmp_mask = torch.arange(self.window+1).expand(val_data.shape[0], \
+                    # self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                    # # BS X max_timesteps
+                    # padding_mask = tmp_mask[:, None, :].to(val_data.device)
 
-                    ori_data_cond = torch.cat((obj_com_pos, obj_bps_data), dim=-1) # BS X T X (3+1024*3)
+                    # # Get validation loss
+                    # val_loss_diffusion = self.model(val_data, cond_mask, padding_mask)
+                    # val_loss = val_loss_diffusion
+                    # if self.use_wandb:
+                    #     val_log_dict = {
+                    #         "Validation/Loss/Total Loss": val_loss.item(),
+                    #         "Validation/Loss/Diffusion Loss": val_loss_diffusion.item(),
+                    #     }
+                    #     wandb.log(val_log_dict)
 
-                    cond_mask = None 
+                    # milestone = self.step // self.save_and_sample_every
+                    # bs_for_vis = 1
 
-                    # Generate padding mask 
-                    actual_seq_len = val_data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
-                    tmp_mask = torch.arange(self.window+1).expand(val_data.shape[0], \
-                    self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
-                    # BS X max_timesteps
-                    padding_mask = tmp_mask[:, None, :].to(val_data.device)
+                    # if self.step % self.save_and_sample_every == 0:
+                    #     self.save(milestone)
 
-                    # Get validation loss 
-                    val_loss_diffusion = self.model(val_data, ori_data_cond, cond_mask, padding_mask)
-                    val_loss = val_loss_diffusion 
-                    if self.use_wandb:
-                        val_log_dict = {
-                            "Validation/Loss/Total Loss": val_loss.item(),
-                            "Validation/Loss/Diffusion Loss": val_loss_diffusion.item(),
-                        }
-                        wandb.log(val_log_dict)
+                    #     all_res_list = self.ema.ema_model.sample(val_data, cond_mask, padding_mask)
+                    #     all_res_list = all_res_list[:bs_for_vis]
 
-                    milestone = self.step // self.save_and_sample_every
-            
-                    bs_for_vis = 1
-
-                    if self.step % self.save_and_sample_every == 0:
-                        self.save(milestone)
-
-                        all_res_list = self.ema.ema_model.sample(val_data, ori_data_cond, cond_mask, padding_mask)
-                        all_res_list = all_res_list[:bs_for_vis]
-
-                        self.gen_vis_res(all_res_list, val_data_dict, self.step, vis_tag="pred_jpos")
+                    #     # Visualization
+                    #     for_vis_gt_data = val_data[:bs_for_vis]
+                    #     self.gen_vis_res(for_vis_gt_data, val_data_dict, self.step, vis_gt=True)
+                    #     self.gen_vis_res(all_res_list, val_data_dict, self.step)
 
             self.step += 1
 
-        print('training complete')
+        print("training complete")
 
         if self.use_wandb:
             wandb.run.finish()
 
+    def validation_step(self, val_data_dict):
+        cond = val_data_dict["condition"]
+        device = cond.device
+        seq_len = torch.tensor([cond.shape[1]]).to(
+            device
+        )
+
+        actual_seq_len = seq_len + 1
+        tmp_mask = torch.arange(opt.window + 1, device=device).expand(
+            1, opt.window + 1
+        ) < actual_seq_len[:, None].repeat(1, opt.window + 1)
+        padding_mask = tmp_mask[:, None, :]
+        object_motion = val_data_dict["target"]
+        cond = val_data_dict["condition"]
+
+        with autocast(enabled=True):
+            val_loss_diffusion = self.model(object_motion, cond, padding_mask=padding_mask)
+
+        # Get validation loss
+        # val_loss_diffusion = self.model(val_data, cond_mask, padding_mask)
+
+
+        val_loss = val_loss_diffusion
+        if self.use_wandb:
+            val_log_dict = {
+                "Validation/Loss/Total Loss": val_loss.item(),
+                "Validation/Loss/Diffusion Loss": val_loss_diffusion.item(),
+            }
+            wandb.log(val_log_dict)
+
+        milestone = self.step // self.save_and_sample_every
+        bs_for_vis = 1
+
+        if self.step % self.save_and_sample_every == 0:
+            self.save(milestone)
+            sample = val_data_dict
+            diffusion_model = self.ema.ema_model
+
+            hand_poses_raw = sample["hand_raw"][:bs_for_vis]  # [1, T, 2*D] - left + right hand
+            object_motion_raw = sample["target_raw"][:bs_for_vis]
+            left_hand_raw, right_hand_raw = torch.split(hand_poses_raw, 21 * 3, dim=-1)
+            cond = sample["condition"][:bs_for_vis]
+            seq_len = torch.tensor([cond.shape[1]])
+            object_motion = sample["target"][:bs_for_vis]
+            
+            object_pred_raw, _ = diffusion_model.sample_raw(
+                torch.randn_like(object_motion), cond, padding_mask=padding_mask
+            )
+            self.gen_vis_res(
+                self.step,
+                left_hand_raw,
+                right_hand_raw,
+                object_motion_raw,
+                object_noisy=sample["traj_noisy_raw"],
+                object_pred=object_pred_raw,
+                seq_len=seq_len,
+                pref="val/",
+            )
+
     def cond_sample_res(self):
         weights = os.listdir(self.results_folder)
-        weights_paths = [os.path.join(self.results_folder, weight) for weight in weights]
+        weights_paths = [
+            os.path.join(self.results_folder, weight) for weight in weights
+        ]
         weight_path = max(weights_paths, key=os.path.getctime)
-   
+
         print(f"Loaded weight: {weight_path}")
 
         milestone = weight_path.split("/")[-1].split("-")[-1].replace(".pt", "")
-        
+
         self.load(milestone)
         self.ema.ema_model.eval()
 
-        num_sample = 50
-        
-        with torch.no_grad():
-            for s_idx in range(num_sample):
-                if self.test_on_train:
-                    val_data_dict = next(self.dl)
-                else:
-                    val_data_dict = next(self.val_dl)
-                val_data = val_data_dict['motion'].cuda()
-
-                val_data = self.extract_palm_jpos_only_data(val_data)
-                # BS X T X (2*3) 
-     
-                obj_bps_data = val_data_dict['obj_bps'].cuda()
-                obj_com_pos = val_data_dict['obj_com_pos'].cuda() 
-
-                ori_data_cond = torch.cat((obj_com_pos, obj_bps_data), dim=-1) # BS X T X (3+1024*3)
-
-                cond_mask = None 
-
-                # Generate padding mask 
-                actual_seq_len = val_data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
-                tmp_mask = torch.arange(self.window+1).expand(val_data.shape[0], \
-                self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
-                # BS X max_timesteps
-                padding_mask = tmp_mask[:, None, :].to(val_data.device)
-
-                max_num = 1
-
-                all_res_list = self.ema.ema_model.sample(val_data, ori_data_cond, \
-                cond_mask=cond_mask, padding_mask=padding_mask)
-
-                vis_tag = str(milestone)+"_stage1_sample_"+str(s_idx)
-
-                if self.test_on_train:
-                    vis_tag = vis_tag + "_on_train"
-                
-                self.gen_vis_res(all_res_list[:max_num], val_data_dict, milestone, vis_tag=vis_tag)
-
-    def extract_palm_jpos_only_data(self, data_input):
-        # data_input: BS X T X D (22*3+22*6)
-        lpalm_idx = 22
-        rpalm_idx = 23 
-        data_input = torch.cat((data_input[:, :, lpalm_idx*3:lpalm_idx*3+3], \
-                data_input[:, :, rpalm_idx*3:rpalm_idx*3+3]), dim=-1)
-        # BS X T X (2*3)
-
-        return data_input 
-
-    def create_ball_mesh(self, center_pos, ball_mesh_path):
-        # center_pos: 4(2) X 3  
-        lhand_color = np.asarray([255, 87, 51])  # red 
-        rhand_color = np.asarray([17, 99, 226]) # blue
-        lfoot_color = np.asarray([134, 17, 226]) # purple 
-        rfoot_color = np.asarray([22, 173, 100]) # green 
-
-        color_list = [lhand_color, rhand_color, lfoot_color, rfoot_color]
-
-        num_mesh = center_pos.shape[0]
-        for idx in range(num_mesh):
-            ball_mesh = trimesh.primitives.Sphere(radius=0.05, center=center_pos[idx])
-            
-            dest_ball_mesh = trimesh.Trimesh(
-                vertices=ball_mesh.vertices,
-                faces=ball_mesh.faces,
-                vertex_colors=color_list[idx],
-                process=False)
-
-            result = trimesh.exchange.ply.export_ply(dest_ball_mesh, encoding='ascii')
-            output_file = open(ball_mesh_path.replace(".ply", "_"+str(idx)+".ply"), "wb+")
-            output_file.write(result)
-            output_file.close()
-
-    def export_to_mesh(self, mesh_verts, mesh_faces, mesh_path):
-        dest_mesh = trimesh.Trimesh(
-            vertices=mesh_verts,
-            faces=mesh_faces,
-            process=False)
-
-        result = trimesh.exchange.ply.export_ply(dest_mesh, encoding='ascii')
-        output_file = open(mesh_path, "wb+")
-        output_file.write(result)
-        output_file.close()
-
-    def process_hand_foot_contact_jpos(self, hand_foot_jpos, object_mesh_verts, object_mesh_faces, obj_rot):
-        # hand_foot_jpos: T X 2 X 3 
-        # object_mesh_verts: T X Nv X 3 
-        # object_mesh_faces: Nf X 3 
-        # obj_rot: T X 3 X 3 
-        all_contact_labels = []
-        all_object_c_idx_list = []
-        all_dist = []
-
-        obj_rot = torch.from_numpy(obj_rot).to(hand_foot_jpos.device)
-        object_mesh_verts = object_mesh_verts.to(hand_foot_jpos.device)
-
-        num_joints = hand_foot_jpos.shape[1]
-        num_steps = hand_foot_jpos.shape[0]
-
-        threshold = 0.03 # Use palm position, should be smaller. 
-       
-        joint2object_dist = torch.cdist(hand_foot_jpos, object_mesh_verts.to(hand_foot_jpos.device)) # T X 2 X Nv 
-     
-        all_dist, all_object_c_idx_list = joint2object_dist.min(dim=2) # T X 2
-        all_contact_labels = all_dist < threshold # T X 2
-
-        new_hand_foot_jpos = hand_foot_jpos.clone() # T X 2 X 3 
-
-        # For each joint, scan the sequence, if contact is true, then use the corresponding object idx for the 
-        # rest of subsequence in contact. 
-        for j_idx in range(num_joints):
-            continue_prev_contact = False 
-            for t_idx in range(num_steps):
-                if continue_prev_contact:
-                    relative_rot_mat = torch.matmul(obj_rot[t_idx], reference_obj_rot.inverse())
-                    curr_contact_normal = torch.matmul(relative_rot_mat, contact_normal[:, None]).squeeze(-1)
-
-                    new_hand_foot_jpos[t_idx, j_idx] = object_mesh_verts[t_idx, subseq_contact_v_id] + \
-                        curr_contact_normal  # 3  
-                
-                elif all_contact_labels[t_idx, j_idx] and not continue_prev_contact: # The first contact frame 
-                    subseq_contact_v_id = all_object_c_idx_list[t_idx, j_idx]
-                    subseq_contact_pos = object_mesh_verts[t_idx, subseq_contact_v_id] # 3 
-
-                    contact_normal = new_hand_foot_jpos[t_idx, j_idx] - subseq_contact_pos # Keep using this in the following frames. 
-
-                    reference_obj_rot = obj_rot[t_idx] # 3 X 3 
-
-                    continue_prev_contact = True 
-
-        return new_hand_foot_jpos 
-
-    def gen_vis_res(self, all_res_list, data_dict, step, vis_gt=False, vis_tag=None):
-        # all_res_list: BS X T X 12  
-        lhand_color = np.asarray([255, 87, 51])  # red 
-        rhand_color = np.asarray([17, 99, 226]) # blue
-        lfoot_color = np.asarray([134, 17, 226]) # purple 
-        rfoot_color = np.asarray([22, 173, 100]) # green 
-
-        contact_pcs_colors = []
-        contact_pcs_colors.append(lhand_color)
-        contact_pcs_colors.append(rhand_color)
-        contact_pcs_colors.append(lfoot_color)
-        contact_pcs_colors.append(rfoot_color)
-        contact_pcs_colors = np.asarray(contact_pcs_colors) # 4 X 3 
-        
-        seq_names = data_dict['seq_name'] # BS 
-        seq_len = data_dict['seq_len'].detach().cpu().numpy() # BS 
-
-        # obj_rot = data_dict['obj_rot_mat'][:all_res_list.shape[0]].to(all_res_list.device) # BS X T X 3 X 3
-        obj_com_pos = data_dict['obj_com_pos'][:all_res_list.shape[0]].to(all_res_list.device) # BS X T X 3 
-
-        num_seq, num_steps, _ = all_res_list.shape
-        
-        normalized_gt_hand_foot_pos = self.extract_palm_jpos_only_data(data_dict['motion']) 
-        # Denormalize hand only 
-        pred_hand_foot_pos = self.ds.de_normalize_jpos_min_max_hand_foot(all_res_list, hand_only=True) # BS X T X 2 X 3 
-
-        gt_hand_foot_pos = self.ds.de_normalize_jpos_min_max_hand_foot(normalized_gt_hand_foot_pos, hand_only=True) # BS X T X 2 X 3
-        gt_hand_foot_pos = gt_hand_foot_pos.reshape(-1, num_steps, 2, 3) 
-        
-        all_processed_hand_jpos = pred_hand_foot_pos.clone() 
-
-        for seq_idx in range(num_seq):
-            object_name = seq_names[seq_idx].split("_")[1]
-            obj_scale = data_dict['obj_scale'][seq_idx].detach().cpu().numpy()
-            obj_trans = data_dict['obj_trans'][seq_idx].detach().cpu().numpy()
-            obj_rot = data_dict['obj_rot_mat'][seq_idx].detach().cpu().numpy() 
-            if object_name in ["mop", "vacuum"]:
-                obj_bottom_scale = data_dict['obj_bottom_scale'][seq_idx].detach().cpu().numpy() 
-                obj_bottom_trans = data_dict['obj_bottom_trans'][seq_idx].detach().cpu().numpy()
-                obj_bottom_rot = data_dict['obj_bottom_rot_mat'][seq_idx].detach().cpu().numpy()
-            else:
-                obj_bottom_scale = None 
-                obj_bottom_trans = None 
-                obj_bottom_rot = None 
-
-            obj_mesh_verts, obj_mesh_faces = self.ds.load_object_geometry(object_name, \
-            obj_scale, obj_trans, obj_rot, \
-            obj_bottom_scale, obj_bottom_trans, obj_bottom_rot)
-
-            # Add postprocessing for hand positions. 
-            if self.add_hand_processing:
-                curr_seq_pred_hand_foot_jpos = self.process_hand_foot_contact_jpos(pred_hand_foot_pos[seq_idx], \
-                                    obj_mesh_verts, obj_mesh_faces, obj_rot)
-
-                all_processed_hand_jpos[seq_idx] = curr_seq_pred_hand_foot_jpos 
-            else:
-                curr_seq_pred_hand_foot_jpos = pred_hand_foot_pos[seq_idx]
-
-        if self.use_gt_hand_for_eval:
-            all_processed_hand_jpos = self.ds.normalize_jpos_min_max_hand_foot(gt_hand_foot_pos.cuda())
-        else:
-            all_processed_hand_jpos = self.ds.normalize_jpos_min_max_hand_foot(all_processed_hand_jpos) # BS X T X 4 X 3 
-
-        gt_hand_foot_pos = self.ds.normalize_jpos_min_max_hand_foot(gt_hand_foot_pos.cuda())
-
-        return all_processed_hand_jpos, gt_hand_foot_pos  
-
-    def run_two_stage_pipeline(self):
-        fullbody_wdir = os.path.join(self.opt.project, self.opt.fullbody_exp_name, "weights")
-       
-        repr_dim = 24 * 3 + 22 * 6 
-    
-        loss_type = "l1"
-        
-        # Create full body diffusion model. 
-        fullbody_diffusion_model = FullBodyCondGaussianDiffusion(self.opt, d_feats=repr_dim, d_model=opt.d_model, \
-                    n_dec_layers=self.opt.n_dec_layers, n_head=self.opt.n_head, d_k=self.opt.d_k, d_v=self.opt.d_v, \
-                    max_timesteps=self.opt.window+1, out_dim=repr_dim, timesteps=1000, \
-                    objective="pred_x0", loss_type=loss_type, \
-                    batch_size=self.opt.batch_size)
-        fullbody_diffusion_model.to(device)
-
-        fullbody_trainer = FullBodyTrainer(
-            self.opt,
-            fullbody_diffusion_model,
-            train_batch_size=32, # 32
-            train_lr=1e-4, # 1e-4
-            train_num_steps=8000000,         # total training steps
-            gradient_accumulate_every=2,    # gradient accumulation steps
-            ema_decay=0.995,                # exponential moving average decay
-            amp=True,                        # turn on mixed precision
-            results_folder=fullbody_wdir,
-            use_wandb=False 
-        )
-        fullbody_trainer.load(milestone=0, pretrained_path=self.opt.fullbody_checkpoint)
-        fullbody_trainer.ema.ema_model.eval()
-      
-        # Load pretrained mdoel for stage 1 
-        self.load(milestone=0, pretrained_path=self.opt.checkpoint)
-        self.ema.ema_model.eval()
-
-        s1_global_hand_jpe_list = [] 
-        s1_global_lhand_jpe_list = []
-        s1_global_rhand_jpe_list = [] 
-
-        global_hand_jpe_list = [] 
+        global_hand_jpe_list = []
         global_lhand_jpe_list = []
-        global_rhand_jpe_list = [] 
+        global_rhand_jpe_list = []
 
         mpvpe_list = []
         mpjpe_list = []
 
         rot_dist_list = []
         root_trans_err_list = []
-        
+
         collision_percent_list = []
         collision_depth_list = []
-
         gt_collision_percent_list = []
         gt_collision_depth_list = []
 
-        gt_foot_sliding_jnts_list = []
         foot_sliding_jnts_list = []
+        gt_foot_sliding_jnts_list = []
 
         contact_precision_list = []
-        contact_recall_list = [] 
-
+        contact_recall_list = []
         contact_acc_list = []
         contact_f1_score_list = []
 
-        gt_contact_dist_list = []
         contact_dist_list = []
+        gt_contact_dist_list = []
 
         if self.test_on_train:
             test_loader = torch.utils.data.DataLoader(
-                self.ds, batch_size=8, shuffle=False,
-                num_workers=0, pin_memory=True, drop_last=False) 
+                self.ds,
+                batch_size=8,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=False,
+            )
         else:
             test_loader = torch.utils.data.DataLoader(
-                self.val_ds, batch_size=8, shuffle=False,
-                num_workers=0, pin_memory=True, drop_last=False) 
-        
+                self.val_ds,
+                batch_size=8,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=False,
+            )
+
         if self.for_quant_eval:
             num_samples_per_seq = 20
         else:
@@ -572,294 +654,361 @@ class Trainer(object):
 
         with torch.no_grad():
             for s_idx, val_data_dict in enumerate(test_loader):
+                val_data = val_data_dict["motion"].cuda()
 
-                if (not s_idx % 8 == 0) and (not self.for_quant_eval): # Visualize part of data
-                    continue 
+                cond_mask = None
 
-                val_data = val_data_dict['motion'].cuda()
+                left_joint_mask = self.prep_joint_condition_mask(
+                    val_data, joint_idx=22, pos_only=True
+                )
+                right_joint_mask = self.prep_joint_condition_mask(
+                    val_data, joint_idx=23, pos_only=True
+                )
 
-                bs, num_steps, _ = val_data.shape 
+                if cond_mask is not None:
+                    cond_mask = cond_mask * left_joint_mask * right_joint_mask
+                else:
+                    cond_mask = left_joint_mask * right_joint_mask
 
-                val_data = self.extract_palm_jpos_only_data(val_data)
-
-                obj_bps_data = val_data_dict['obj_bps'].cuda()
-                obj_com_pos = val_data_dict['obj_com_pos'].cuda() 
-
-                ori_data_cond = torch.cat((obj_com_pos, obj_bps_data), dim=-1) # BS X T X (3+1024*3)
-
-                cond_mask = None 
-
-                # Generate padding mask 
-                actual_seq_len = val_data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
-                tmp_mask = torch.arange(self.window+1).expand(val_data.shape[0], \
-                self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                # Generate padding mask
+                actual_seq_len = (
+                    val_data_dict["seq_len"] + 1
+                )  # BS, + 1 since we need additional timestep for noise level
+                tmp_mask = torch.arange(self.window + 1).expand(
+                    val_data.shape[0], self.window + 1
+                ) < actual_seq_len[:, None].repeat(1, self.window + 1)
                 # BS X max_timesteps
                 padding_mask = tmp_mask[:, None, :].to(val_data.device)
 
-                # Each sequence, sample multiple times to compute metrics. 
-                s1_lhand_jpe_per_seq = []
-                s1_rhand_jpe_per_seq = []
-                s1_hand_jpe_per_seq = [] 
-               
                 hand_jpe_per_seq = []
                 lhand_jpe_per_seq = []
                 rhand_jpe_per_seq = []
 
                 mpvpe_per_seq = []
                 mpjpe_per_seq = []
-                
+
                 rot_dist_per_seq = []
                 trans_err_per_seq = []
-                
+
                 gt_foot_sliding_jnts_per_seq = []
                 foot_sliding_jnts_per_seq = []
-                
-                contact_precision_per_seq = []
-                contact_recall_per_seq = [] 
-
-                contact_acc_per_seq = []
-                contact_f1_score_per_seq = [] 
 
                 gt_contact_dist_per_seq = []
                 contact_dist_per_seq = []
 
+                contact_precision_per_seq = []
+                contact_recall_per_seq = []
+
+                contact_acc_per_seq = []
+                contact_f1_score_per_seq = []
+
                 sampled_all_res_per_seq = []
+
                 for sample_idx in range(num_samples_per_seq):
-                    # Stage 1 
-                    pred_hand_foot_jpos = self.ema.ema_model.sample(val_data, ori_data_cond, \
-                    cond_mask=cond_mask, padding_mask=padding_mask)
+                    all_res_list = self.ema.ema_model.sample(
+                        val_data, cond_mask=cond_mask, padding_mask=padding_mask
+                    )  # BS X T X D
 
-                    vis_tag = "stage1_sample_"+str(s_idx)
-                    if self.add_hand_processing:
-                        vis_tag = vis_tag + "_add_hand_processing"
+                    sampled_all_res_per_seq.append(all_res_list)
 
-                    if self.test_on_train:
-                        vis_tag = vis_tag + "_on_train"
-
-                    if self.use_object_split:
-                        vis_tag += "_unseen_objects"
-
-                    pred_hand_foot_jpos, gt_hand_foot_pos = self.gen_vis_res(pred_hand_foot_jpos, \
-                    val_data_dict, 0, vis_tag=vis_tag)
-                
-                    tmp_pred_hand_jpos = self.ds.de_normalize_jpos_min_max_hand_foot(pred_hand_foot_jpos.reshape(bs, num_steps, -1), hand_only=True) # BS X T X 2 X 3 
-                    tmp_gt_hand_jpos = self.ds.de_normalize_jpos_min_max_hand_foot(gt_hand_foot_pos.reshape(bs, num_steps, -1), hand_only=True)
-
-                    for s1_s_idx in range(bs): 
-                        s1_lhand_jpe, s1_rhand_jpe, s1_hand_jpe = compute_s1_metrics(tmp_pred_hand_jpos[s1_s_idx, \
-                            :actual_seq_len[s1_s_idx]], tmp_gt_hand_jpos[s1_s_idx, :actual_seq_len[s1_s_idx]])
-                      
-                        s1_lhand_jpe_per_seq.append(s1_lhand_jpe)
-                        s1_rhand_jpe_per_seq.append(s1_rhand_jpe)
-                        s1_hand_jpe_per_seq.append(s1_hand_jpe)
-
-                    # Feed the predicted hand and foot position to full-body diffusion model. 
-                    all_res_list = fullbody_trainer.gen_fullbody_from_predicted_hand_foot(pred_hand_foot_jpos, val_data_dict)
-
-                    sampled_all_res_per_seq.append(all_res_list) 
-
-                    vis_tag = "two_stage_pipeline_sample_"+str(s_idx)+"_try_"+str(sample_idx)
-
-                    if self.add_hand_processing:
-                        vis_tag = vis_tag + "_add_hand_processing"
+                    vis_tag = (
+                        str(milestone)
+                        + "_sidx_"
+                        + str(s_idx)
+                        + "_sample_cnt_"
+                        + str(sample_idx)
+                    )
 
                     if self.test_on_train:
                         vis_tag = vis_tag + "_on_train"
-
-                    if self.use_object_split:
-                        vis_tag += "_unseen_objects"
-
-                    if self.use_gt_hand_for_eval:
-                        vis_tag += "_use_gt_hand"
 
                     num_seq = all_res_list.shape[0]
                     for seq_idx in range(num_seq):
+                        curr_vis_tag = vis_tag + "_seq_idx_in_bs_" + str(seq_idx)
+                        (
+                            pred_human_trans_list,
+                            pred_human_rot_list,
+                            pred_human_jnts_list,
+                            pred_human_verts_list,
+                            human_faces_list,
+                            obj_verts_list,
+                            obj_faces_list,
+                            actual_len_list,
+                        ) = self.gen_vis_res(
+                            all_res_list[seq_idx : seq_idx + 1],
+                            val_data_dict,
+                            milestone,
+                            vis_tag=curr_vis_tag,
+                            for_quant_eval=self.for_quant_eval,
+                            selected_seq_idx=seq_idx,
+                        )
+                        (
+                            gt_human_trans_list,
+                            gt_human_rot_list,
+                            gt_human_jnts_list,
+                            gt_human_verts_list,
+                            human_faces_list,
+                            obj_verts_list,
+                            obj_faces_list,
+                            actual_len_list,
+                        ) = self.gen_vis_res(
+                            val_data_dict["motion"].cuda()[seq_idx : seq_idx + 1],
+                            val_data_dict,
+                            milestone,
+                            vis_gt=True,
+                            vis_tag=curr_vis_tag,
+                            for_quant_eval=self.for_quant_eval,
+                            selected_seq_idx=seq_idx,
+                        )
 
-                        # A trick to fix artifacts when using add_hand_processing.
-                        # The artifact is that when the hand positions are the same in a row, the root translation would be suddenly changed. 
-                        if self.add_hand_processing:
-                            tmp_pred_hand_jpos = pred_hand_foot_jpos[seq_idx] # T X 2 X 3 
-                            tmp_num_steps = actual_seq_len[seq_idx]-1
-                            
-                            repeat_idx = None 
-                            for tmp_idx in range(tmp_num_steps-5, tmp_num_steps):
-                                hand_jpos_diff = tmp_pred_hand_jpos[tmp_idx] - tmp_pred_hand_jpos[tmp_idx-1] # 2 X 3 
-                                threshold = 0.001
-                             
-                                if (torch.abs(hand_jpos_diff[0, 0]) < threshold and torch.abs(hand_jpos_diff[0, 1]) < threshold \
-                                and torch.abs(hand_jpos_diff[0, 2]) < threshold) or (torch.abs(hand_jpos_diff[1, 0]) < threshold \
-                                and torch.abs(hand_jpos_diff[1, 1]) < threshold and torch.abs(hand_jpos_diff[1, 2]) < threshold):
-                                    repeat_idx = tmp_idx 
-                                    break 
-                            
-                            if repeat_idx is not None:
-                                padding_last = all_res_list[seq_idx:seq_idx+1, repeat_idx-1:repeat_idx] # 1 X 1 X 198 
-                                padding_last = padding_last.repeat(1, pred_hand_foot_jpos.shape[1]-repeat_idx, 1) # 1 X t' X D 
-                                
-                                curr_seq_res_list = torch.cat((all_res_list[seq_idx:seq_idx+1, :repeat_idx], padding_last), dim=1)
-                            else:
-                                curr_seq_res_list = all_res_list[seq_idx:seq_idx+1]
-                        else:
-                            curr_seq_res_list = all_res_list[seq_idx:seq_idx+1]
-
-                        curr_vis_tag = vis_tag + "_seq_idx_in_bs_"+str(seq_idx) 
-                      
-                        pred_human_trans_list, pred_human_rot_list, pred_human_jnts_list, pred_human_verts_list, human_faces_list, \
-                            obj_verts_list, obj_faces_list, actual_len_list = \
-                            fullbody_trainer.gen_vis_res(curr_seq_res_list, val_data_dict, \
-                            0, vis_tag=curr_vis_tag, for_quant_eval=self.for_quant_eval, selected_seq_idx=seq_idx)
-                        gt_human_trans_list, gt_human_rot_list, gt_human_jnts_list, gt_human_verts_list, human_faces_list, \
-                            obj_verts_list, obj_faces_list, actual_len_list = \
-                            fullbody_trainer.gen_vis_res(val_data_dict['motion'].cuda()[seq_idx:seq_idx+1], val_data_dict, \
-                            0, vis_gt=True, vis_tag=curr_vis_tag, for_quant_eval=self.for_quant_eval, selected_seq_idx=seq_idx)
-                    
-                        lhand_jpe, rhand_jpe, hand_jpe, mpvpe, mpjpe, rot_dist, trans_err, gt_contact_dist, contact_dist, \
-                                gt_foot_sliding_jnts, foot_sliding_jnts, contact_precision, contact_recall, \
-                                contact_acc, contact_f1_score = \
-                                compute_metrics(gt_human_verts_list, pred_human_verts_list, gt_human_jnts_list, pred_human_jnts_list, human_faces_list, \
-                                gt_human_trans_list, pred_human_trans_list, gt_human_rot_list, pred_human_rot_list, \
-                                obj_verts_list, obj_faces_list, actual_len_list, use_joints24=True)
+                        (
+                            lhand_jpe,
+                            rhand_jpe,
+                            hand_jpe,
+                            mpvpe,
+                            mpjpe,
+                            rot_dist,
+                            trans_err,
+                            gt_contact_dist,
+                            contact_dist,
+                            gt_foot_sliding_jnts,
+                            foot_sliding_jnts,
+                            contact_precision,
+                            contact_recall,
+                            contact_acc,
+                            contact_f1_score,
+                        ) = compute_metrics(
+                            gt_human_verts_list,
+                            pred_human_verts_list,
+                            gt_human_jnts_list,
+                            pred_human_jnts_list,
+                            human_faces_list,
+                            gt_human_trans_list,
+                            pred_human_trans_list,
+                            gt_human_rot_list,
+                            pred_human_rot_list,
+                            obj_verts_list,
+                            obj_faces_list,
+                            actual_len_list,
+                            use_joints24=True,
+                        )
 
                         hand_jpe_per_seq.append(hand_jpe)
                         lhand_jpe_per_seq.append(lhand_jpe)
-                        rhand_jpe_per_seq.append(rhand_jpe) 
+                        rhand_jpe_per_seq.append(rhand_jpe)
 
                         mpvpe_per_seq.append(mpvpe)
                         mpjpe_per_seq.append(mpjpe)
-                        
+
                         rot_dist_per_seq.append(rot_dist)
-                        trans_err_per_seq.append(trans_err) 
-                        
+                        trans_err_per_seq.append(trans_err)
+
                         gt_foot_sliding_jnts_per_seq.append(gt_foot_sliding_jnts)
                         foot_sliding_jnts_per_seq.append(foot_sliding_jnts)
-                        
-                        contact_precision_per_seq.append(contact_precision)
-                        contact_recall_per_seq.append(contact_recall) 
 
-                        contact_acc_per_seq.append(contact_acc) 
-                        contact_f1_score_per_seq.append(contact_f1_score) 
+                        contact_precision_per_seq.append(contact_precision)
+                        contact_recall_per_seq.append(contact_recall)
+
+                        contact_acc_per_seq.append(contact_acc)
+                        contact_f1_score_per_seq.append(contact_f1_score)
 
                         gt_contact_dist_per_seq.append(gt_contact_dist)
                         contact_dist_per_seq.append(contact_dist)
 
-                        # print("*****************************************Single Sequence*****************************************")
-                        # print("Left Hand JPE: {0}, Right Hand JPE: {1}, Two Hands JPE: {2}".format(lhand_jpe, rhand_jpe, hand_jpe))
-                        # print("MPJPE: {0}, MPVPE: {1}, Root Trans: {2}, Global Rot Err: {3}".format(mpjpe, mpvpe, trans_err, rot_dist))
-                        # print("Foot sliding verts: {0}, Foot sliding jnts: {1}".format(foot_sliding_verts, foot_sliding_jnts))
-                        # print("Collision percent: {0}, Collision depth: {1}".format(collision_percent, mean_collide_depth))
-    
-                        # fullbody_trainer.gen_vis_res(curr_seq_res_list, val_data_dict, \
-                        #     milestone, vis_tag=vis_tag, selected_seq_idx=seq_idx)
-                        # fullbody_trainer.gen_vis_res(val_data_dict['motion'].cuda()[seq_idx:seq_idx+1], val_data_dict, \
-                        #     milestone, vis_gt=True, vis_tag=vis_tag, selected_seq_idx=seq_idx)
-
-                        # break 
-        
                 if self.for_quant_eval:
-                    s1_lhand_jpe_per_seq = np.asarray(s1_lhand_jpe_per_seq).reshape(num_samples_per_seq, num_seq)
-                    s1_rhand_jpe_per_seq = np.asarray(s1_rhand_jpe_per_seq).reshape(num_samples_per_seq, num_seq)
-                    s1_hand_jpe_per_seq = np.asarray(s1_hand_jpe_per_seq).reshape(num_samples_per_seq, num_seq)
+                    hand_jpe_per_seq = np.asarray(hand_jpe_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
+                    lhand_jpe_per_seq = np.asarray(lhand_jpe_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
+                    rhand_jpe_per_seq = np.asarray(rhand_jpe_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
 
-                    hand_jpe_per_seq = np.asarray(hand_jpe_per_seq).reshape(num_samples_per_seq, num_seq)
-                    lhand_jpe_per_seq = np.asarray(lhand_jpe_per_seq).reshape(num_samples_per_seq, num_seq)
-                    rhand_jpe_per_seq = np.asarray(rhand_jpe_per_seq).reshape(num_samples_per_seq, num_seq) 
+                    mpvpe_per_seq = np.asarray(mpvpe_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
+                    mpjpe_per_seq = np.asarray(mpjpe_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
 
-                    mpvpe_per_seq = np.asarray(mpvpe_per_seq).reshape(num_samples_per_seq, num_seq) 
-                    mpjpe_per_seq = np.asarray(mpjpe_per_seq).reshape(num_samples_per_seq, num_seq) # Sample_num X BS 
-                    
-                    rot_dist_per_seq = np.asarray(rot_dist_per_seq).reshape(num_samples_per_seq, num_seq)
-                    trans_err_per_seq = np.asarray(trans_err_per_seq).reshape(num_samples_per_seq, num_seq) 
-                    
-                    gt_foot_sliding_jnts_per_seq = np.asarray(gt_foot_sliding_jnts_per_seq).reshape(num_samples_per_seq, num_seq)
-                    foot_sliding_jnts_per_seq = np.asarray(foot_sliding_jnts_per_seq).reshape(num_samples_per_seq, num_seq) 
-                    
-                    contact_precision_per_seq = np.asarray(contact_precision_per_seq).reshape(num_samples_per_seq, num_seq) 
-                    contact_recall_per_seq = np.asarray(contact_recall_per_seq).reshape(num_samples_per_seq, num_seq) 
+                    rot_dist_per_seq = np.asarray(rot_dist_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
+                    trans_err_per_seq = np.asarray(trans_err_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
 
-                    contact_acc_per_seq = np.asarray(contact_acc_per_seq).reshape(num_samples_per_seq, num_seq) 
-                    contact_f1_score_per_seq = np.asarray(contact_f1_score_per_seq).reshape(num_samples_per_seq, num_seq) 
+                    gt_foot_sliding_jnts_per_seq = np.asarray(
+                        gt_foot_sliding_jnts_per_seq
+                    ).reshape(num_samples_per_seq, num_seq)
+                    foot_sliding_jnts_per_seq = np.asarray(
+                        foot_sliding_jnts_per_seq
+                    ).reshape(num_samples_per_seq, num_seq)
 
-                    gt_contact_dist_per_seq = np.asarray(gt_contact_dist_per_seq).reshape(num_samples_per_seq, num_seq)
-                    contact_dist_per_seq = np.asarray(contact_dist_per_seq).reshape(num_samples_per_seq, num_seq) 
+                    contact_precision_per_seq = np.asarray(
+                        contact_precision_per_seq
+                    ).reshape(num_samples_per_seq, num_seq)
+                    contact_recall_per_seq = np.asarray(contact_recall_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
 
-                    best_sample_idx = mpjpe_per_seq.argmin(axis=0) # sample_num 
+                    contact_acc_per_seq = np.asarray(contact_acc_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
+                    contact_f1_score_per_seq = np.asarray(
+                        contact_f1_score_per_seq
+                    ).reshape(num_samples_per_seq, num_seq)
 
-                    s1_hand_jpe = s1_hand_jpe_per_seq[best_sample_idx, list(range(num_seq))]
-                    s1_lhand_jpe = s1_lhand_jpe_per_seq[best_sample_idx, list(range(num_seq))]
-                    s1_rhand_jpe = s1_rhand_jpe_per_seq[best_sample_idx, list(range(num_seq))]
+                    gt_contact_dist_per_seq = np.asarray(
+                        gt_contact_dist_per_seq
+                    ).reshape(num_samples_per_seq, num_seq)
+                    contact_dist_per_seq = np.asarray(contact_dist_per_seq).reshape(
+                        num_samples_per_seq, num_seq
+                    )
 
-                    hand_jpe = hand_jpe_per_seq[best_sample_idx, list(range(num_seq))] # BS 
+                    best_sample_idx = mpjpe_per_seq.argmin(axis=0)  # sample_num
+
+                    hand_jpe = hand_jpe_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]  # BS
                     lhand_jpe = lhand_jpe_per_seq[best_sample_idx, list(range(num_seq))]
                     rhand_jpe = rhand_jpe_per_seq[best_sample_idx, list(range(num_seq))]
-                    
+
                     mpvpe = mpvpe_per_seq[best_sample_idx, list(range(num_seq))]
                     mpjpe = mpjpe_per_seq[best_sample_idx, list(range(num_seq))]
-                    
+
                     rot_dist = rot_dist_per_seq[best_sample_idx, list(range(num_seq))]
                     trans_err = trans_err_per_seq[best_sample_idx, list(range(num_seq))]
-                   
-                    gt_foot_sliding_jnts = gt_foot_sliding_jnts_per_seq[best_sample_idx, list(range(num_seq))]
-                    foot_sliding_jnts = foot_sliding_jnts_per_seq[best_sample_idx, list(range(num_seq))]
 
-                    contact_precision_seq = contact_precision_per_seq[best_sample_idx, list(range(num_seq))]
-                    contact_recall_seq = contact_recall_per_seq[best_sample_idx, list(range(num_seq))] 
-                    contact_acc_seq = contact_acc_per_seq[best_sample_idx, list(range(num_seq))]
-                    contact_f1_score_seq = contact_f1_score_per_seq[best_sample_idx, list(range(num_seq))]
+                    gt_foot_sliding_jnts = gt_foot_sliding_jnts_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
+                    foot_sliding_jnts = foot_sliding_jnts_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
 
-                    gt_contact_dist_seq = gt_contact_dist_per_seq[best_sample_idx, list(range(num_seq))]
-                    contact_dist_seq = contact_dist_per_seq[best_sample_idx, list(range(num_seq))] 
+                    contact_precision_seq = contact_precision_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
+                    contact_recall_seq = contact_recall_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
 
-                    sampled_all_res_per_seq = torch.stack(sampled_all_res_per_seq) # K X BS X T X D 
-                    best_sampled_all_res = sampled_all_res_per_seq[best_sample_idx, list(range(num_seq))] # BS X T X D 
+                    contact_acc_seq = contact_acc_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
+                    contact_f1_score_seq = contact_f1_score_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
+
+                    gt_contact_dist_seq = gt_contact_dist_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
+                    contact_dist_seq = contact_dist_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]
+
+                    sampled_all_res_per_seq = torch.stack(
+                        sampled_all_res_per_seq
+                    )  # K X BS X T X D
+                    best_sampled_all_res = sampled_all_res_per_seq[
+                        best_sample_idx, list(range(num_seq))
+                    ]  # BS X T X D
                     num_seq = best_sampled_all_res.shape[0]
                     for seq_idx in range(num_seq):
-                        pred_human_trans_list, pred_human_rot_list, pred_human_jnts_list, pred_human_verts_list, human_faces_list, \
-                            obj_verts_list, obj_faces_list, actual_len_list = \
-                            fullbody_trainer.gen_vis_res(best_sampled_all_res[seq_idx:seq_idx+1], val_data_dict, \
-                            0, vis_tag=vis_tag, for_quant_eval=True, selected_seq_idx=seq_idx)
-                        gt_human_trans_list, gt_human_rot_list, gt_human_jnts_list, gt_human_verts_list, human_faces_list, \
-                            obj_verts_list, obj_faces_list, actual_len_list = \
-                            fullbody_trainer.gen_vis_res(val_data_dict['motion'].cuda()[seq_idx:seq_idx+1], val_data_dict, \
-                            0, vis_gt=True, vis_tag=vis_tag, for_quant_eval=True, selected_seq_idx=seq_idx)
+                        (
+                            pred_human_trans_list,
+                            pred_human_rot_list,
+                            pred_human_jnts_list,
+                            pred_human_verts_list,
+                            human_faces_list,
+                            obj_verts_list,
+                            obj_faces_list,
+                            actual_len_list,
+                        ) = self.gen_vis_res(
+                            best_sampled_all_res[seq_idx : seq_idx + 1],
+                            val_data_dict,
+                            milestone,
+                            vis_tag=vis_tag,
+                            for_quant_eval=True,
+                            selected_seq_idx=seq_idx,
+                        )
+                        (
+                            gt_human_trans_list,
+                            gt_human_rot_list,
+                            gt_human_jnts_list,
+                            gt_human_verts_list,
+                            human_faces_list,
+                            obj_verts_list,
+                            obj_faces_list,
+                            actual_len_list,
+                        ) = self.gen_vis_res(
+                            val_data_dict["motion"].cuda()[seq_idx : seq_idx + 1],
+                            val_data_dict,
+                            milestone,
+                            vis_gt=True,
+                            vis_tag=vis_tag,
+                            for_quant_eval=True,
+                            selected_seq_idx=seq_idx,
+                        )
 
-                        obj_scale = val_data_dict['obj_scale'][seq_idx]
-                        obj_trans = val_data_dict['obj_trans'][seq_idx]
-                        obj_rot_mat = val_data_dict['obj_rot_mat'][seq_idx]
-                        actual_len = val_data_dict['seq_len'][seq_idx]
-                        object_name = val_data_dict['obj_name'][seq_idx]
+                        obj_scale = val_data_dict["obj_scale"][seq_idx]
+                        obj_trans = val_data_dict["obj_trans"][seq_idx]
+                        obj_rot_mat = val_data_dict["obj_rot_mat"][seq_idx]
+                        actual_len = val_data_dict["seq_len"][seq_idx]
+                        object_name = val_data_dict["obj_name"][seq_idx]
+                        pred_collision_percent, pred_collision_depth = (
+                            compute_collision(
+                                pred_human_verts_list.cpu(),
+                                human_faces_list,
+                                obj_verts_list.cpu(),
+                                obj_faces_list,
+                                object_name,
+                                obj_scale,
+                                obj_rot_mat,
+                                obj_trans,
+                                actual_len,
+                            )
+                        )
 
-                        pred_collision_percent, pred_collision_depth = compute_collision(pred_human_verts_list.cpu(), \
-                            human_faces_list, obj_verts_list.cpu(), obj_faces_list, object_name, \
-                            obj_scale, obj_rot_mat, obj_trans, actual_len)
-                            
-                        gt_collision_percent, gt_collision_depth = compute_collision(gt_human_verts_list.cpu(), \
-                            human_faces_list, obj_verts_list.cpu(), obj_faces_list, object_name, \
-                            obj_scale, obj_rot_mat, obj_trans, actual_len)
+                        gt_collision_percent, gt_collision_depth = compute_collision(
+                            gt_human_verts_list.cpu(),
+                            human_faces_list,
+                            obj_verts_list.cpu(),
+                            obj_faces_list,
+                            object_name,
+                            obj_scale,
+                            obj_rot_mat,
+                            obj_trans,
+                            actual_len,
+                        )
 
                         collision_percent_list.append(pred_collision_percent)
                         collision_depth_list.append(pred_collision_depth)
                         gt_collision_percent_list.append(gt_collision_percent)
-                        gt_collision_depth_list.append(gt_collision_depth) 
-                        
-                    for tmp_seq_idx in range(num_seq):
-                        s1_global_lhand_jpe_list.append(s1_lhand_jpe[tmp_seq_idx])
-                        s1_global_rhand_jpe_list.append(s1_rhand_jpe[tmp_seq_idx])
-                        s1_global_hand_jpe_list.append(s1_hand_jpe[tmp_seq_idx])
+                        gt_collision_depth_list.append(gt_collision_depth)
 
+                    # Get the min error
+                    for tmp_seq_idx in range(num_seq):
                         global_hand_jpe_list.append(hand_jpe[tmp_seq_idx])
                         global_lhand_jpe_list.append(lhand_jpe[tmp_seq_idx])
                         global_rhand_jpe_list.append(rhand_jpe[tmp_seq_idx])
 
                         mpvpe_list.append(mpvpe[tmp_seq_idx])
                         mpjpe_list.append(mpjpe[tmp_seq_idx])
-                        
                         rot_dist_list.append(rot_dist[tmp_seq_idx])
                         root_trans_err_list.append(trans_err[tmp_seq_idx])
-                        
-                        gt_foot_sliding_jnts_list.append(gt_foot_sliding_jnts[tmp_seq_idx])
+
+                        gt_foot_sliding_jnts_list.append(
+                            gt_foot_sliding_jnts[tmp_seq_idx]
+                        )
                         foot_sliding_jnts_list.append(foot_sliding_jnts[tmp_seq_idx])
 
-                        contact_precision_list.append(contact_precision_seq[tmp_seq_idx])
+                        contact_precision_list.append(
+                            contact_precision_seq[tmp_seq_idx]
+                        )
                         contact_recall_list.append(contact_recall_seq[tmp_seq_idx])
 
                         contact_acc_list.append(contact_acc_seq[tmp_seq_idx])
@@ -868,185 +1017,514 @@ class Trainer(object):
                         gt_contact_dist_list.append(gt_contact_dist_seq[tmp_seq_idx])
                         contact_dist_list.append(contact_dist_seq[tmp_seq_idx])
 
-                # if s_idx > 0:
-                #     break 
-
         if self.for_quant_eval:
-            s1_mean_hand_jpe = np.asarray(s1_global_hand_jpe_list).mean()
-            s1_mean_lhand_jpe = np.asarray(s1_global_lhand_jpe_list).mean()
-            s1_mean_rhand_jpe = np.asarray(s1_global_rhand_jpe_list).mean() 
-
-            mean_hand_jpe = np.asarray(global_hand_jpe_list).mean() 
+            mean_hand_jpe = np.asarray(global_hand_jpe_list).mean()
             mean_lhand_jpe = np.asarray(global_lhand_jpe_list).mean()
             mean_rhand_jpe = np.asarray(global_rhand_jpe_list).mean()
-            
-            mean_mpvpe = np.asarray(mpvpe_list).mean()
-            mean_mpjpe = np.asarray(mpjpe_list).mean() 
 
-            mean_rot_dist = np.asarray(rot_dist_list).mean() 
+            mean_mpvpe = np.asarray(mpvpe_list).mean()
+            mean_mpjpe = np.asarray(mpjpe_list).mean()
+            mean_rot_dist = np.asarray(rot_dist_list).mean()
             mean_root_trans_err = np.asarray(root_trans_err_list).mean()
-            
+
             mean_collision_percent = np.asarray(collision_percent_list).mean()
-            mean_collision_depth = np.asarray(collision_depth_list).mean() 
+            mean_collision_depth = np.asarray(collision_depth_list).mean()
 
             gt_mean_collision_percent = np.asarray(gt_collision_percent_list).mean()
-            gt_mean_collision_depth = np.asarray(gt_collision_depth_list).mean() 
-            
+            gt_mean_collision_depth = np.asarray(gt_collision_depth_list).mean()
+
             mean_gt_fsliding_jnts = np.asarray(gt_foot_sliding_jnts_list).mean()
-            mean_fsliding_jnts = np.asarray(foot_sliding_jnts_list).mean() 
+            mean_fsliding_jnts = np.asarray(foot_sliding_jnts_list).mean()
 
             mean_contact_precision = np.asarray(contact_precision_list).mean()
-            mean_contact_recall = np.asarray(contact_recall_list).mean() 
+            mean_contact_recall = np.asarray(contact_recall_list).mean()
 
             mean_contact_acc = np.asarray(contact_acc_list).mean()
-            mean_contact_f1_score = np.asarray(contact_f1_score_list).mean() 
+            mean_contact_f1_score = np.asarray(contact_f1_score_list).mean()
 
             mean_gt_contact_dist = np.asarray(gt_contact_dist_list).mean()
             mean_contact_dist = np.asarray(contact_dist_list).mean()
 
-            print("*****************************************Quantitative Evaluation*****************************************")
+            print(
+                "*****************************************Quantitative Evaluation*****************************************"
+            )
             print("The number of sequences: {0}".format(len(mpjpe_list)))
-            print("Stage 1 Left Hand JPE: {0}, Stage 1 Right Hand JPE: {1}, Stage 1 Two Hands JPE: {2}".format(s1_mean_lhand_jpe, s1_mean_rhand_jpe, s1_mean_hand_jpe))
-            print("Left Hand JPE: {0}, Right Hand JPE: {1}, Two Hands JPE: {2}".format(mean_lhand_jpe, mean_rhand_jpe, mean_hand_jpe))
-            print("MPJPE: {0}, MPVPE: {1}, Root Trans: {2}, Global Rot Err: {3}".format(mean_mpjpe, mean_mpvpe, mean_root_trans_err, mean_rot_dist))
-            print("Foot sliding jnts: {0}, GT Foot sliding jnts: {1}".format(mean_fsliding_jnts, mean_gt_fsliding_jnts))
-            print("Collision percent: {0}, Collision depth: {1}".format(mean_collision_percent, mean_collision_depth))
-            print("GT Collision percent: {0}, GT Collision depth: {1}".format(gt_mean_collision_percent, gt_mean_collision_depth))
-            print("Contact precision: {0}, Contact recall: {1}".format(mean_contact_precision, mean_contact_recall))
-            print("Contact Acc: {0}, Contact F1 score: {1}".format(mean_contact_acc, mean_contact_f1_score)) 
-            print("Contact dist: {0}, GT Contact dist: {1}".format(mean_contact_dist, mean_gt_contact_dist))
+            print(
+                "Left Hand JPE: {0}, Right Hand JPE: {1}, Two Hands JPE: {2}".format(
+                    mean_lhand_jpe, mean_rhand_jpe, mean_hand_jpe
+                )
+            )
+            print(
+                "MPJPE: {0}, MPVPE: {1}, Root Trans: {2}, Global Rot Err: {3}".format(
+                    mean_mpjpe, mean_mpvpe, mean_root_trans_err, mean_rot_dist
+                )
+            )
+            print(
+                "Foot sliding jnts: {0}, GT Foot sliding jnts: {1}".format(
+                    mean_fsliding_jnts, mean_gt_fsliding_jnts
+                )
+            )
+            print(
+                "Collision percent: {0}, Collision depth: {1}".format(
+                    mean_collision_percent, mean_collision_depth
+                )
+            )
+            print(
+                "GT Collision percent: {0}, GT Collision depth: {1}".format(
+                    gt_mean_collision_percent, gt_mean_collision_depth
+                )
+            )
+            print(
+                "Contact precision: {0}, Contact recall: {1}".format(
+                    mean_contact_precision, mean_contact_recall
+                )
+            )
+            print(
+                "Contact Acc: {0}, COntact F1 score: {1}".format(
+                    mean_contact_acc, mean_contact_f1_score
+                )
+            )
+            print(
+                "Contact dist: {0}, GT Contact dist: {1}".format(
+                    mean_contact_dist, mean_gt_contact_dist
+                )
+            )
+
+    def gen_vis_res(self, *args, **kwargs):
+        self.visualizer.log_training_step(*args, **kwargs)
+
+    def gen_vis_res_legacy(
+        self,
+        all_res_list,
+        data_dict,
+        step,
+        vis_gt=False,
+        vis_tag=None,
+        for_quant_eval=False,
+        selected_seq_idx=None,
+    ):
+        # all_res_list: N X T X D
+        num_seq = all_res_list.shape[0]
+
+        num_joints = 24
+
+        normalized_global_jpos = all_res_list[:, :, : num_joints * 3].reshape(
+            num_seq, -1, num_joints, 3
+        )
+
+        global_jpos = self.ds.de_normalize_jpos_min_max(
+            normalized_global_jpos.reshape(-1, num_joints, 3)
+        )
+        global_jpos = global_jpos.reshape(num_seq, -1, num_joints, 3)  # N X T X 22 X 3
+        global_root_jpos = global_jpos[:, :, 0, :].clone()  # N X T X 3
+
+        global_rot_6d = all_res_list[:, :, -22 * 6 :].reshape(num_seq, -1, 22, 6)
+        global_rot_mat = transforms.rotation_6d_to_matrix(
+            global_rot_6d
+        )  # N X T X 22 X 3 X 3
+
+        trans2joint = data_dict["trans2joint"].to(all_res_list.device)  # N X 3
+
+        seq_len = data_dict["seq_len"].detach().cpu().numpy()  # BS
+
+        # Used for quantitative evaluation.
+        human_trans_list = []
+        human_rot_list = []
+        human_jnts_list = []
+        human_verts_list = []
+        human_faces_list = []
+
+        obj_verts_list = []
+        obj_faces_list = []
+
+        actual_len_list = []
+
+        for idx in range(num_seq):
+            curr_global_rot_mat = global_rot_mat[idx]  # T X 22 X 3 X 3
+            curr_local_rot_mat = quat_ik_torch(curr_global_rot_mat)  # T X 22 X 3 X 3
+            curr_local_rot_aa_rep = transforms.matrix_to_axis_angle(
+                curr_local_rot_mat
+            )  # T X 22 X 3
+
+            curr_global_root_jpos = global_root_jpos[idx]  # T X 3
+
+            if selected_seq_idx is None:
+                curr_trans2joint = trans2joint[idx : idx + 1].clone()
+            else:
+                curr_trans2joint = trans2joint[
+                    selected_seq_idx : selected_seq_idx + 1
+                ].clone()
+
+            root_trans = curr_global_root_jpos + curr_trans2joint  # T X 3
+
+            # Generate global joint position
+            bs = 1
+            if selected_seq_idx is None:
+                betas = data_dict["betas"][idx]
+                gender = data_dict["gender"][idx]
+                curr_obj_rot_mat = data_dict["obj_rot_mat"][idx]
+                curr_obj_trans = data_dict["obj_trans"][idx]
+                curr_obj_scale = data_dict["obj_scale"][idx]
+                curr_seq_name = data_dict["seq_name"][idx]
+                object_name = curr_seq_name.split("_")[1]
+            else:
+                betas = data_dict["betas"][selected_seq_idx]
+                gender = data_dict["gender"][selected_seq_idx]
+                curr_obj_rot_mat = data_dict["obj_rot_mat"][selected_seq_idx]
+                curr_obj_trans = data_dict["obj_trans"][selected_seq_idx]
+                curr_obj_scale = data_dict["obj_scale"][selected_seq_idx]
+                curr_seq_name = data_dict["seq_name"][selected_seq_idx]
+                object_name = curr_seq_name.split("_")[1]
+
+            # Get human verts
+            mesh_jnts, mesh_verts, mesh_faces = run_smplx_model(
+                root_trans[None].cuda(),
+                curr_local_rot_aa_rep[None].cuda(),
+                betas.cuda(),
+                [gender],
+                self.ds.bm_dict,
+                return_joints24=True,
+            )
+
+            # Get object verts
+            if object_name in ["mop", "vacuum"]:
+                if selected_seq_idx is None:
+                    curr_obj_bottom_rot_mat = data_dict["obj_bottom_rot_mat"][idx]
+                    curr_obj_bottom_trans = data_dict["obj_bottom_trans"][idx]
+                    curr_obj_bottom_scale = data_dict["obj_bottom_scale"][idx]
+                else:
+                    curr_obj_bottom_rot_mat = data_dict["obj_bottom_rot_mat"][
+                        selected_seq_idx
+                    ]
+                    curr_obj_bottom_trans = data_dict["obj_bottom_trans"][
+                        selected_seq_idx
+                    ]
+                    curr_obj_bottom_scale = data_dict["obj_bottom_scale"][
+                        selected_seq_idx
+                    ]
+
+                obj_mesh_verts, obj_mesh_faces = self.ds.load_object_geometry(
+                    object_name,
+                    curr_obj_scale.detach().cpu().numpy(),
+                    curr_obj_trans.detach().cpu().numpy(),
+                    curr_obj_rot_mat.detach().cpu().numpy(),
+                    curr_obj_bottom_scale.detach().cpu().numpy(),
+                    curr_obj_bottom_trans.detach().cpu().numpy(),
+                    curr_obj_bottom_rot_mat.detach().cpu().numpy(),
+                )
+            else:
+                obj_mesh_verts, obj_mesh_faces = self.ds.load_object_geometry(
+                    object_name,
+                    curr_obj_scale.detach().cpu().numpy(),
+                    curr_obj_trans.detach().cpu().numpy(),
+                    curr_obj_rot_mat.detach().cpu().numpy(),
+                )
+
+            human_trans_list.append(root_trans)
+            human_jnts_list.append(mesh_jnts)
+            human_verts_list.append(mesh_verts)
+            human_faces_list.append(mesh_faces)
+
+            human_rot_list.append(curr_global_rot_mat)
+
+            obj_verts_list.append(obj_mesh_verts)
+            obj_faces_list.append(obj_mesh_faces)
+
+            if selected_seq_idx is None:
+                actual_len_list.append(seq_len[idx])
+            else:
+                actual_len_list.append(seq_len[selected_seq_idx])
+
+            if vis_tag is None:
+                dest_mesh_vis_folder = os.path.join(
+                    self.vis_folder, "blender_mesh_vis", str(step)
+                )
+            else:
+                dest_mesh_vis_folder = os.path.join(self.vis_folder, vis_tag, str(step))
+
+            if not self.for_quant_eval:
+                if not os.path.exists(dest_mesh_vis_folder):
+                    os.makedirs(dest_mesh_vis_folder)
+
+                if vis_gt:
+                    mesh_save_folder = os.path.join(
+                        dest_mesh_vis_folder,
+                        "objs_step_" + str(step) + "_bs_idx_" + str(idx) + "_gt",
+                    )
+                    out_rendered_img_folder = os.path.join(
+                        dest_mesh_vis_folder,
+                        "imgs_step_" + str(step) + "_bs_idx_" + str(idx) + "_gt",
+                    )
+                    out_vid_file_path = os.path.join(
+                        dest_mesh_vis_folder,
+                        "vid_step_" + str(step) + "_bs_idx_" + str(idx) + "_gt.mp4",
+                    )
+                else:
+                    mesh_save_folder = os.path.join(
+                        dest_mesh_vis_folder,
+                        "objs_step_" + str(step) + "_bs_idx_" + str(idx),
+                    )
+                    out_rendered_img_folder = os.path.join(
+                        dest_mesh_vis_folder,
+                        "imgs_step_" + str(step) + "_bs_idx_" + str(idx),
+                    )
+                    out_vid_file_path = os.path.join(
+                        dest_mesh_vis_folder,
+                        "vid_step_" + str(step) + "_bs_idx_" + str(idx) + ".mp4",
+                    )
+
+                if selected_seq_idx is None:
+                    actual_len = seq_len[idx]
+                else:
+                    actual_len = seq_len[selected_seq_idx]
+
+                if not vis_gt:
+                    save_verts_faces_to_mesh_file_w_object(
+                        mesh_verts.detach().cpu().numpy()[0][:actual_len],
+                        mesh_faces.detach().cpu().numpy(),
+                        obj_mesh_verts.detach().cpu().numpy()[:actual_len],
+                        obj_mesh_faces,
+                        mesh_save_folder,
+                    )
+                    run_blender_rendering_and_save2video(
+                        mesh_save_folder,
+                        out_rendered_img_folder,
+                        out_vid_file_path,
+                        vis_object=True,
+                    )
+
+        human_trans_list = torch.stack(human_trans_list)[0]  # T X 3
+        human_rot_list = torch.stack(human_rot_list)[0]  # T X 22 X 3 X 3
+        human_jnts_list = torch.stack(human_jnts_list)[0, 0]  # T X 22 X 3
+        human_verts_list = torch.stack(human_verts_list)[0, 0]  # T X Nv X 3
+        human_faces_list = (
+            torch.stack(human_faces_list)[0].detach().cpu().numpy()
+        )  # Nf X 3
+
+        obj_verts_list = torch.stack(obj_verts_list)[0]  # T X Nv' X 3
+        obj_faces_list = np.asarray(obj_faces_list)[0]  # Nf X 3
+
+        actual_len_list = np.asarray(actual_len_list)[0]  # scalar value
+
+        return (
+            human_trans_list,
+            human_rot_list,
+            human_jnts_list,
+            human_verts_list,
+            human_faces_list,
+            obj_verts_list,
+            obj_faces_list,
+            actual_len_list,
+        )
 
 def run_train(opt, device):
     # Prepare Directories
     save_dir = Path(opt.save_dir)
-    wdir = save_dir / 'weights'
+    wdir = save_dir / "weights"
     wdir.mkdir(parents=True, exist_ok=True)
 
     # Save run settings
-    with open(save_dir / 'opt.yaml', 'w') as f:
+    with open(save_dir / "opt.yaml", "w") as f:
         yaml.safe_dump(vars(opt), f, sort_keys=True)
 
-    # Define model  
-    repr_dim = 2 * 3 
-   
-    loss_type = "l1"
-  
-    diffusion_model = CondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
-                n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
-                max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
-                objective="pred_x0", loss_type=loss_type, \
-                batch_size=opt.batch_size)
-   
+    # Define model
+    repr_dim = 24 * 3 + 22 * 6
+
+    repr_dim = 9  # Output dimension (3D translation + 6D rotation)
+    cond_dim = 2 * 21 * 3 + 9  # Input dimension (2 hands × pose_dim each)
+
+    diffusion_model = CondGaussianDiffusion(
+        opt,
+        d_feats=repr_dim,
+        condition_dim=cond_dim,
+        d_model=opt.d_model,
+        n_head=opt.n_head,
+        n_dec_layers=opt.n_dec_layers,
+        d_k=opt.d_k,
+        d_v=opt.d_v,
+        max_timesteps=opt.window + 1,
+        out_dim=repr_dim,
+        timesteps=1000,
+        loss_type="l1",
+        objective="pred_x0",
+    )
     diffusion_model.to(device)
 
     trainer = Trainer(
         opt,
         diffusion_model,
-        train_batch_size=opt.batch_size, # 32
-        train_lr=opt.learning_rate, # 1e-4
-        train_num_steps=400000,         # 700000, total training steps
-        gradient_accumulate_every=2,    # gradient accumulation steps
-        ema_decay=0.995,                # exponential moving average decay
-        amp=True,                        # turn on mixed precision
+        train_batch_size=opt.batch_size,  # 32
+        train_lr=opt.learning_rate,  # 1e-4
+        gradient_accumulate_every=2,  # gradient accumulation steps
+        ema_decay=0.995,  # exponential moving average decay
+        amp=True,  # turn on mixed precision
         results_folder=str(wdir),
+        use_wandb=opt.use_wandb,
+        save_and_sample_every=opt.vis_every,
+        train_num_steps=opt.train_num_steps,
     )
 
     trainer.train()
 
     torch.cuda.empty_cache()
 
-def run_sample(opt, device, run_pipeline=False):
+
+def run_sample(opt, device):
     # Prepare Directories
     save_dir = Path(opt.save_dir)
-    wdir = save_dir / 'weights'
+    wdir = save_dir / "weights"
 
-    # Define model 
-    repr_dim = 2 * 3 
-    
+    # Define model
+
     loss_type = "l1"
-    
-    diffusion_model = CondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
-                n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
-                max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
-                objective="pred_x0", loss_type=loss_type, \
-                batch_size=opt.batch_size)
+    repr_dim = 9  # Output dimension (3D translation + 6D rotation)
+    cond_dim = 2 * 21 * 3 + 9  # Input dimension (2 hands × pose_dim each)
 
-    diffusion_model.to(device)
-
+    diffusion_model = CondGaussianDiffusion(
+        opt,
+        d_feats=repr_dim,
+        condition_dim=cond_dim,
+        d_model=opt.d_model,
+        n_head=opt.n_head,
+        n_dec_layers=opt.n_dec_layers,
+        d_k=opt.d_k,
+        d_v=opt.d_v,
+        max_timesteps=opt.window + 1,
+        out_dim=repr_dim,
+        timesteps=1000,
+        loss_type="l1",
+        objective="pred_x0",
+    )
     trainer = Trainer(
         opt,
         diffusion_model,
-        train_batch_size=opt.batch_size, # 32
-        train_lr=opt.learning_rate, # 1e-4
-        train_num_steps=400000,         # 700000, total training steps
-        gradient_accumulate_every=2,    # gradient accumulation steps
-        ema_decay=0.995,                # exponential moving average decay
-        amp=True,                        # turn on mixed precision
+        train_batch_size=opt.batch_size,  # 32
+        train_lr=opt.learning_rate,  # 1e-4
+        train_num_steps=400000,  # total training steps
+        gradient_accumulate_every=2,  # gradient accumulation steps
+        ema_decay=0.995,  # exponential moving average decay
+        amp=True,  # turn on mixed precision
         results_folder=str(wdir),
-        use_wandb=False 
+        use_wandb=False,
     )
-    
-    if run_pipeline:
-        trainer.run_two_stage_pipeline() 
-    else:
-        trainer.cond_sample_res()
+
+    trainer.cond_sample_res()
 
     torch.cuda.empty_cache()
 
+
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--project', default='runs/train', help='output folder for weights and visualizations')
-    parser.add_argument('--wandb_pj_name', type=str, default='wandb_proj_name', help='wandb project name')
-    parser.add_argument('--entity', default='wandb_account_name', help='W&B entity')
-    parser.add_argument('--exp_name', default='stage1_exp_out', help='save to project/exp_name')
-    parser.add_argument('--device', default='0', help='cuda device')
+    parser.add_argument("--project", default="runs/train", help="project/name")
+    parser.add_argument("--wandb_pj_name", type=str, default="", help="project name")
+    parser.add_argument("--entity", default="wandb_account_name", help="W&B entity")
+    parser.add_argument("--exp_name", default="", help="save to project/name")
+    parser.add_argument("--device", default="0", help="cuda device")
 
-    parser.add_argument('--fullbody_exp_name', default='stage2_exp_out', help='project/fullbody_exp_name')
-    parser.add_argument('--fullbody_checkpoint', type=str, default="", help='checkpoint')
+    parser.add_argument("--window", type=int, default=120, help="horizon")
 
-    parser.add_argument('--window', type=int, default=120, help='horizon')
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument(
+        "--learning_rate", type=float, default=2e-4, help="generator_learning_rate"
+    )
 
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size')
-    parser.add_argument('--learning_rate', type=float, default=2e-4, help='generator_learning_rate')
+    parser.add_argument(
+        "--fullbody_checkpoint", type=str, default="", help="checkpoint"
+    )
 
-    parser.add_argument('--checkpoint', type=str, default="", help='checkpoint')
+    parser.add_argument(
+        "--n_dec_layers", type=int, default=4, help="the number of decoder layers"
+    )
+    parser.add_argument(
+        "--n_head", type=int, default=4, help="the number of heads in self-attention"
+    )
+    parser.add_argument(
+        "--d_k", type=int, default=256, help="the dimension of keys in transformer"
+    )
+    parser.add_argument(
+        "--d_v", type=int, default=256, help="the dimension of values in transformer"
+    )
+    parser.add_argument(
+        "--d_model",
+        type=int,
+        default=512,
+        help="the dimension of intermediate representation in transformer",
+    )
 
-    parser.add_argument('--n_dec_layers', type=int, default=4, help='the number of decoder layers')
-    parser.add_argument('--n_head', type=int, default=4, help='the number of heads in self-attention')
-    parser.add_argument('--d_k', type=int, default=256, help='the dimension of keys in transformer')
-    parser.add_argument('--d_v', type=int, default=256, help='the dimension of values in transformer')
-    parser.add_argument('--d_model', type=int, default=512, help='the dimension of intermediate representation in transformer')
-    
-    # For testing sampled results 
+    # For testing sampled results
     parser.add_argument("--test_sample_res", action="store_true")
 
-    # For testing sampled results on training dataset 
+    # For testing sampled results on training dataset
     parser.add_argument("--test_sample_res_on_train", action="store_true")
-
-    # For running the whole pipeline. 
-    parser.add_argument("--run_whole_pipeline", action="store_true")
 
     parser.add_argument("--add_hand_processing", action="store_true")
 
     parser.add_argument("--for_quant_eval", action="store_true")
 
-    parser.add_argument("--use_gt_hand_for_eval", action="store_true")
-
     parser.add_argument("--use_object_split", action="store_true")
 
-    parser.add_argument('--data_root_folder', default='data', help='root folder for dataset')
+    parser.add_argument(
+        "--data_root_folder", default="data", help="root folder for dataset"
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="/move/u/yufeiy2/data/HOT3D/pred_pose/mini_P0001_624f2ba9.npz",
+        help="Path to processed data pickle file",
+    )
+    parser.add_argument("--noise_std_obj_rot", type=float, default=2)
+    parser.add_argument("--noise_std_obj_trans", type=float, default=0.1)
+    parser.add_argument("--noise_std_mano_global_rot", type=float, default=2)
+    parser.add_argument("--noise_std_mano_body_rot", type=float, default=2)
+    parser.add_argument("--noise_std_mano_trans", type=float, default=0.1)
+    parser.add_argument("--noise_std_mano_betas", type=float, default=0.2)
+
+    parser.add_argument(
+        "--demo_id",
+        type=str,
+        default=None,
+        help="Specific demo ID to use (if None, use first available)",
+    )
+    parser.add_argument(
+        "--target_object_id",
+        type=str,
+        default=None,
+        help="Specific object ID to track (if None, use first available)",
+    )
+    parser.add_argument(
+        "--sampling_mode",
+        type=str,
+        default="random",
+        choices=["random", "sequential"],
+        help="Window sampling mode: random (better performance) or sequential",
+    )    
+    parser.add_argument(
+        "--use_velocity",
+        action="store_true",
+        default=False,
+        help="Use 12D data with velocity (default: False)",
+    )
+    parser.add_argument(
+        "--use_rerun", action="store_true", help="Use Rerun for real-time visualization"
+    )
+    parser.add_argument(
+            "--use_wandb", action="store_true", help="Use wandb for logging"
+    )
+
+    parser.add_argument("--train_num_steps", type=int, default=1_000_000)
+    parser.add_argument("--vis_every", type=int, default=1000)
+    parser.add_argument("--eval_every", type=int, default=1000)
 
     opt = parser.parse_args()
     return opt
 
+
 if __name__ == "__main__":
     opt = parse_opt()
     opt.save_dir = os.path.join(opt.project, opt.exp_name)
-    opt.exp_name = opt.save_dir.split('/')[-1]
+    opt.exp_name = opt.save_dir.split("/")[-1]
     device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
     if opt.test_sample_res:
         run_sample(opt, device)
-    elif opt.run_whole_pipeline:
-        run_sample(opt, device, run_pipeline=True)
     else:
         run_train(opt, device)

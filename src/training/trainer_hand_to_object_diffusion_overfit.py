@@ -1,25 +1,26 @@
 import argparse
 import os
-import sys
-import numpy as np
-import yaml
-import torch
-from torch.optim import Adam
-from torch.cuda.amp import autocast, GradScaler
-from pathlib import Path
-import wandb
 import pickle
 import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import wandb
+import yaml
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import Adam
+from tqdm import tqdm
 
 # Add the project root to Python path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.manip.model.transformer_hand_to_object_diffusion_model import (
-    CondGaussianDiffusion,
-)
-from src.visualization.rerun_visualizer import RerunVisualizer
 from src.manip.data.hand_to_object_dataset import HandToObjectDataset
+from src.manip.model.transformer_hand_to_object_diffusion_model import \
+    CondGaussianDiffusion
+from src.visualization.rerun_visualizer import RerunVisualizer
 
 
 def sample_full_trajectory_inpaint(
@@ -167,7 +168,14 @@ def sample_full_trajectory_sliding_window(
     return sampled_trajectory.cpu()
 
 
-def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10, visualizer:RerunVisualizer =None, global_step=0):
+def evaluate_model(
+    diffusion_model,
+    val_dataset,
+    device,
+    num_eval_windows=10,
+    visualizer: RerunVisualizer = None,
+    global_step=0,
+):
     """
     Evaluate the model by sampling from multiple windows and computing trajectory accuracy.
     Returns dictionary with position, rotation, and combined errors.
@@ -256,7 +264,7 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10, vi
             total_rotation_errors.append(mean_rot_error)
             total_combined_errors.append(mean_combined_error)
 
-            # visualize 
+            # visualize
             hand_raw = sample["hand_raw"].unsqueeze(0).to(device)
             left_hand_raw, right_hand_raw = torch.split(hand_raw, 21 * 3, dim=-1)
             object_motion_raw = sample["target_raw"].unsqueeze(0).to(device)
@@ -265,7 +273,13 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10, vi
             mean_velocity = sample["mean_velocity"]
 
             if visualizer:
-                print('hand', left_hand_raw.shape, right_hand_raw.shape, object_motion_raw.shape, object_pred_raw.shape)
+                print(
+                    "hand",
+                    left_hand_raw.shape,
+                    right_hand_raw.shape,
+                    object_motion_raw.shape,
+                    object_pred_raw.shape,
+                )
                 visualizer.log_training_step(
                     global_step,
                     left_hand_raw,
@@ -276,9 +290,8 @@ def evaluate_model(diffusion_model, val_dataset, device, num_eval_windows=10, vi
                     seq_len=seq_len,
                     is_moving=is_moving,
                     mean_velocity=mean_velocity,
-                    pref='val/',
+                    pref="val/",
                 )
-
 
     # Compute overall metrics
     overall_mean_pos_error = sum(total_position_errors) / len(total_position_errors)
@@ -319,15 +332,13 @@ def train_overfit(opt, device):
         sampling_strategy="random",
         split="mini",
         split_seed=42,  # Ensure reproducible splits
-        noise_scheme='syn',
+        noise_scheme="syn",
         noise_std_obj_rot=opt.noise_std_obj_rot,
         noise_std_obj_trans=opt.noise_std_obj_trans,
-
         noise_std_mano_global_rot=opt.noise_std_mano_global_rot,
         noise_std_mano_body_rot=opt.noise_std_mano_body_rot,
         noise_std_mano_trans=opt.noise_std_mano_trans,
-        noise_std_mano_betas=opt.noise_std_mano_betas
-
+        noise_std_mano_betas=opt.noise_std_mano_betas,
     )
 
     val_dataset = HandToObjectDataset(
@@ -339,7 +350,7 @@ def train_overfit(opt, device):
         sampling_strategy="random",
         split="mini",
         split_seed=42,  # Use same seed for consistent splits
-        noise_scheme='real',
+        noise_scheme="real",
     )
 
     # Create combined dataset for final evaluation
@@ -424,6 +435,13 @@ def train_overfit(opt, device):
         visualizer.setup_for_overfit_training(
             full_dataset, object_id=full_dataset.target_object_id
         )
+    elif opt.use_pt3d:
+        visualizer = Pt3dVisualizer(
+            exp_name=opt.exp_name,
+            save_dir=opt.save_dir,
+        )
+        # visualizer.setup_template(full_dataset.target_object_id)
+
     else:
         print("Rerun visualization disabled")
 
@@ -441,7 +459,7 @@ def train_overfit(opt, device):
     print(f"  Total epochs: {total_epochs}")
     print(f"  Total steps: {total_steps}")
 
-    for epoch in range(total_epochs):
+    for epoch in tqdm(range(total_epochs)):
         # Create new permutation at the start of each epoch
         epoch_indices = np.random.permutation(train_dataset_size)
 
@@ -465,8 +483,8 @@ def train_overfit(opt, device):
             mask_prob = 0.5
             max_infill_ratio = 0.1
             prob = random.uniform(0, 1)
+            batch_size, clip_len, _ = cond.shape
             if prob > 1 - mask_prob:
-                batch_size, clip_len, _ = cond.shape
                 traj_feat_dim = sample["traj_noisy_raw"].shape[-1]
                 start = torch.FloatTensor(batch_size).uniform_(0, clip_len - 1).long()
                 mask_len = (
@@ -482,7 +500,9 @@ def train_overfit(opt, device):
                 mask_traj_exp = mask_traj.unsqueeze(-1).repeat(
                     1, 1, traj_feat_dim
                 )  # [bs, t, 4]
-                cond[:, :, -traj_feat_dim:] = cond[:, :, -traj_feat_dim:] * mask_traj_exp
+                cond[:, :, -traj_feat_dim:] = (
+                    cond[:, :, -traj_feat_dim:] * mask_traj_exp
+                )
             else:
                 mask_traj = torch.ones(batch_size, clip_len).to(device)
 
@@ -510,7 +530,12 @@ def train_overfit(opt, device):
             if global_step % 1000 == 0:
                 print(f"\n  Evaluating model at step {global_step}...")
                 eval_results = evaluate_model(
-                    diffusion_model, val_dataset, device, num_eval_windows=5, visualizer=visualizer, global_step=global_step
+                    diffusion_model,
+                    val_dataset,
+                    device,
+                    num_eval_windows=5,
+                    visualizer=visualizer,
+                    global_step=global_step,
                 )
 
                 print(f"  Evaluation Results:")
@@ -852,36 +877,12 @@ def parse_opt():
         help="Number of frames for enhanced scene visualization",
     )
 
-    parser.add_argument(
-        "--noise_std_obj_rot",
-        type=float,
-        default=2
-    )
-    parser.add_argument(
-        "-- ",
-        type=float,
-        default=0.1,
-    )
-    parser.add_argument(
-        "--noise_std_mano_global_rot",
-        type=float,
-        default=2,
-    )
-    parser.add_argument(
-            "--noise_std_mano_body_rot",
-        type=float,
-        default=2,
-    )
-    parser.add_argument(
-        "--noise_std_mano_trans",
-        type=float,
-        default=0.1,
-    )
-    parser.add_argument(
-        "--noise_std_mano_betas",
-        type=float,
-        default=0.2,
-    )
+    parser.add_argument("--noise_std_obj_rot", type=float, default=2)
+    parser.add_argument("--noise_std_obj_trans", type=float, default=0.1)
+    parser.add_argument("--noise_std_mano_global_rot", type=float, default=2)
+    parser.add_argument("--noise_std_mano_body_rot", type=float, default=2)
+    parser.add_argument("--noise_std_mano_trans", type=float, default=0.1)
+    parser.add_argument("--noise_std_mano_betas", type=float, default=0.2)
 
     opt = parser.parse_args()
     return opt
