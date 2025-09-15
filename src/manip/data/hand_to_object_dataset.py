@@ -102,7 +102,9 @@ class HandToObjectDataset(Dataset):
         noise_std_mano_trans=0.0,
         noise_std_mano_betas=0.0,
         noise_scheme='syn',  # 'syn', 'real'
+        opt=None
     ):
+
         self.is_train = is_train
         self.data_path = data_path
         self.window_size = window_size
@@ -114,6 +116,7 @@ class HandToObjectDataset(Dataset):
         self.split = split
         self.val_split_ratio = val_split_ratio
         self.split_seed = split_seed
+        self.opt = opt
 
         self.mano_model_path = "/move/u/yufeiy2/pretrain/body_models/mano_v1_2/models"
         self.sided_mano_models = {
@@ -140,7 +143,7 @@ class HandToObjectDataset(Dataset):
 
         # Filter for single demo/object if specified (for overfitting)
         if single_demo or single_object:
-            self.processed_data = self._filter_data(single_demo, single_object)
+            self.processed_data = self._filter_data(single_demo, single_object.split(','))
             print(
                 f"Filtered to demo: {single_demo} object: {single_object}, total: {len(self.processed_data)} demonstrations for overfitting"
             )
@@ -177,9 +180,18 @@ class HandToObjectDataset(Dataset):
             seq = list(self.processed_data.keys())[0]
             filtered_data[seq] = {}
             # '194930206998778',
-            obj_list = ["225397651484143"]
-            t0 = 300
-            t1 = t0 + 120
+            if single_object:
+                # 225397651484143 : bowl
+                obj_list = single_object
+            else:
+                obj_list = list(self.processed_data[seq]["objects"].keys())
+                
+            if self.opt.one_window:
+                t0 = self.opt.t0
+                t1 = t0 + 120
+            else:
+                t0 = 0
+                t1 = len(self.processed_data[seq]['wTc'])
             for key, value in self.processed_data[seq].items():
                 if key == "objects":
                     continue
@@ -196,10 +208,8 @@ class HandToObjectDataset(Dataset):
                         if isinstance(v, dict):
                             for kk, vv in v.items():
                                 filtered_data[seq][key][k][kk] = vv[t0:t1]
-                                # print(key, k, kk, filtered_data[seq][key][k][kk].shape)
                         else:
                             filtered_data[seq][key][k] = v[t0:t1]
-                            # print(key, k, filtered_data[seq][key][k].shape)
                 elif isinstance(value, np.ndarray):
                     filtered_data[seq][key] = value[t0:t1]
                 else:
@@ -232,6 +242,10 @@ class HandToObjectDataset(Dataset):
 
         for demo_id, demo_data in self.processed_data.items():
             for obj_id, obj_data in demo_data["objects"].items():
+                print(obj_id, 'current window obj_id:')
+                for win in windows:
+                    print(win['object_id'])
+
                 object_traj = obj_data["wTo"]  # (T, 4, 4)
                 camera_traj = demo_data["wTc"]  # (T, 4, 4)
 
@@ -479,8 +493,8 @@ class HandToObjectDataset(Dataset):
                     windows.append(window_data)
 
         # Apply sampling strategy
-        windows = self._apply_sampling_strategy(windows)
-
+        # windows = self._apply_sampling_strategy(windows)
+        import pdb; pdb.set_trace()
         return windows
 
     def _compute_mean_velocity(self, object_traj):
@@ -695,7 +709,6 @@ class HandToObjectDataset(Dataset):
         if self.windows:
             first_window = self.windows[0]
             self.demo_id = first_window.get("demo_id", "unknown")
-            self.target_object_id = first_window.get("object_id", "unknown")
 
     def has_full_trajectory_data(self):
         """Check if full trajectory data is available."""
@@ -734,9 +747,6 @@ class HandToObjectDataset(Dataset):
 
     def __getitem__(self, idx):
         idx = idx % len(self.windows)
-        # For debug (overfitting)
-        idx = 0
-
         window = self.windows[idx]
 
         ######### 2. add synthetic noise / use off-the-shelf noise to the data ##########
@@ -783,14 +793,11 @@ class HandToObjectDataset(Dataset):
     def add_noise_data(self, can_window_dict):
         # just for 6d pose for now
         if self.noise_scheme == 'real':
-            print('apply real noise')
-            print('valid shape', can_window_dict['shelf_valid'].shape, can_window_dict['object_shelf'].shape, can_window_dict['object'].shape)
             can_window_dict_noisy = deepcopy(can_window_dict)
             can_window_dict_noisy['object'] = can_window_dict['object_shelf']  # [T, D]
             # add mask
             mask = can_window_dict_noisy['shelf_valid'] # [T, ]
             can_window_dict_noisy['object'] = can_window_dict_noisy['object'] * mask[:, None]
-            print('after masking', can_window_dict_noisy['object'].shape)
             return can_window_dict_noisy
         
         ######################################## add noise to  params

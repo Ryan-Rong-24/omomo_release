@@ -279,8 +279,9 @@ class Trainer(object):
             noise_std_mano_global_rot=opt.noise_std_mano_global_rot,
             noise_std_mano_body_rot=opt.noise_std_mano_body_rot,
             noise_std_mano_trans=opt.noise_std_mano_trans,
-            noise_std_mano_betas=opt.noise_std_mano_betas
+            noise_std_mano_betas=opt.noise_std_mano_betas,
 
+            opt=opt,
         )
 
         val_dataset = HandToObjectDataset(
@@ -294,6 +295,7 @@ class Trainer(object):
             split="mini",
             split_seed=42,  # Use same seed for consistent splits
             noise_scheme='real',
+            opt=opt,
         )        
 
         self.ds = train_dataset
@@ -307,15 +309,22 @@ class Trainer(object):
                 num_workers=4,
             )
         )
-        self.val_dl = cycle(
-            data.DataLoader(
+        # self.val_dl = cycle(
+        #     data.DataLoader(
+        #         self.val_ds,
+        #         batch_size=1,
+        #         shuffle=False,
+        #         pin_memory=True,
+        #         num_workers=4,
+        #     )
+        # )
+        self.val_dl = data.DataLoader(
                 self.val_ds,
-                batch_size=self.batch_size,
+                batch_size=1,
                 shuffle=False,
                 pin_memory=True,
                 num_workers=4,
             )
-        )
 
     def save(self, milestone):
         data = {
@@ -480,10 +489,12 @@ class Trainer(object):
                 self.ema.ema_model.eval()
 
                 with torch.no_grad():
-                    val_data_dict = next(self.val_dl)
-                    val_data_dict = model_utils.to_cuda(val_data_dict)
+                    for b, val_data_dict in enumerate(self.val_dl):
+                        print(b, val_data_dict['object_id'])
+                        val_data_dict = model_utils.to_cuda(val_data_dict)
 
-                    self.validation_step(val_data_dict)
+                        self.validation_step(sample, pref=f'{b}/train/')
+                        self.validation_step(val_data_dict, pref=f'{b}/val/')
                     # val_data = val_data_dict['motion'].cuda()
 
                     # if cond_mask is not None:
@@ -529,7 +540,7 @@ class Trainer(object):
         if self.use_wandb:
             wandb.run.finish()
 
-    def validation_step(self, val_data_dict):
+    def validation_step(self, val_data_dict, pref="val/"):
         cond = val_data_dict["condition"]
         device = cond.device
         seq_len = torch.tensor([cond.shape[1]]).to(
@@ -546,10 +557,6 @@ class Trainer(object):
 
         with autocast(enabled=True):
             val_loss_diffusion = self.model(object_motion, cond, padding_mask=padding_mask)
-
-        # Get validation loss
-        # val_loss_diffusion = self.model(val_data, cond_mask, padding_mask)
-
 
         val_loss = val_loss_diffusion
         if self.use_wandb:
@@ -585,7 +592,7 @@ class Trainer(object):
                 object_noisy=sample["traj_noisy_raw"],
                 object_pred=object_pred_raw,
                 seq_len=seq_len,
-                pref="val/",
+                pref=pref,
             )
 
     def cond_sample_res(self):
@@ -1422,6 +1429,8 @@ def parse_opt():
     parser.add_argument("--device", default="0", help="cuda device")
 
     parser.add_argument("--window", type=int, default=120, help="horizon")
+    parser.add_argument("--t0", type=int, default=300, help="start time")
+    parser.add_argument("--one_window", action="store_true", help="use one window")
 
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument(
