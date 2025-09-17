@@ -1524,6 +1524,8 @@ def parse_opt():
     parser.add_argument("--vis_every", type=int, default=1000)
     parser.add_argument("--eval_every", type=int, default=1000)
 
+    parser.add_argument("--use_constant_noise", action="store_true", help="Use constant noise")
+
     opt = parser.parse_args()
     return opt
 

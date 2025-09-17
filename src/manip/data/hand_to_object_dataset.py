@@ -494,7 +494,6 @@ class HandToObjectDataset(Dataset):
 
         # Apply sampling strategy
         # windows = self._apply_sampling_strategy(windows)
-        import pdb; pdb.set_trace()
         return windows
 
     def _compute_mean_velocity(self, object_traj):
@@ -823,14 +822,26 @@ class HandToObjectDataset(Dataset):
                 scale=self.noise_std_params_dict["object_rot"],
                 size=rot_euler.shape,
             )
+
+            # add a constatn random translation noise to object traj
+            if self.opt.use_constant_noise:
+                transl_noise = np.random.normal(loc=0.0, scale=self.noise_std_params_dict['object_trans'], size=(1, transl_noisy.shape[-1]))
+                transl_noisy = transl_noisy + transl_noise
+
+                rot_noise = np.random.normal(loc=0.0, scale=self.noise_std_params_dict['object_rot'], size=(1, rot_euler_noisy.shape[-1]))
+                rot_euler_noisy = rot_euler_noisy + rot_noise
+
             rot_mat_noisy = R.from_euler(
                 "zxy", rot_euler_noisy, degrees=True
             ).as_matrix()
             rot6d_noisy = matrix_to_rotation_6d_numpy(rot_mat_noisy)
-
+            
             can_window_dict_noisy[param_name] = np.concatenate(
                 [transl_noisy, rot6d_noisy], axis=-1
             )
+
+            
+
 
             # if param_name == 'transl' or param_name == 'betas':
             #         noise_1 = np.random.normal(loc=0.0, scale=self.noise_std_params_dict[param_name], size=can_window_dict[param_name].shape)
@@ -920,6 +931,10 @@ def create_hand_to_object_dataset(
         val_split_ratio=val_split_ratio,
         augment=augment,
     )
+
+
+
+
 
 def vis_traj():
     import plotly.graph_objects as go
